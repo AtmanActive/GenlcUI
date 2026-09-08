@@ -1,0 +1,10 @@
+# Genelec GLM network adapter (Gnet USB adapter)
+# Grants members of the "plugdev" group access to the HID device,
+# so genlc / GenlcUI can run without root.
+#
+# Install:
+#   sudo install -m 0644 packaging/udev/70-genelec-glm.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1781", ATTRS{idProduct}=="0e39", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1781", ATTRS{idProduct}=="0e39", MODE="0660", GROUP="plugdev", TAG+="uaccess"

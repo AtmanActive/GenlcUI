@@ -1,0 +1,40 @@
+[project]
+name = "genlcui"
+version = "0.1.0"
+description = "Linux desktop controller for Genelec SAM monitors via the GLM adapter"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "AtmanActive" }]
+keywords = ["genelec", "glm", "sam", "studio monitors", "kde", "plasma"]
+
+# Note the absence of libscrc: genlcui.core.crc implements CRC-16/GSM in pure
+# Python, which drops a C extension that has no wheel for CPython 3.13.
+dependencies = [
+    "hid>=1.0.4",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+genlcui = "genlcui.app:main"
+
+[project.urls]
+Homepage = "https://github.com/AtmanActive/GenlcUI"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["genlcui*"]
+
+[tool.setuptools.package-data]
+"genlcui.ui" = ["*.qml"]
+"genlcui.resources" = ["*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
