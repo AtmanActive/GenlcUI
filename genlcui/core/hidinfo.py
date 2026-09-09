@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,80 @@ def usb_location(hid_path: str) -> Optional[str]:
             break
         current = current.parent
     return None
+
+
+def find_hidraw(vid: int, pid: int) -> Optional[str]:
+    """The /dev/hidrawN node for a USB id, found without opening anything.
+
+    Reads sysfs rather than using hidapi, so it works even when the node is
+    unreadable -- which is exactly the case we need to detect.
+    """
+    try:
+        entries = sorted(SYS_HIDRAW.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            uevent = (entry / "device" / "uevent").read_text()
+        except OSError:
+            continue
+        for line in uevent.splitlines():
+            if not line.startswith("HID_ID="):
+                continue
+            # HID_ID=0003:00001781:00000E39 -- bus, vendor, product, each
+            # zero padded to eight hex digits, so compare as numbers.
+            parts = line.split("=", 1)[1].split(":")
+            if len(parts) != 3:
+                continue
+            try:
+                if int(parts[1], 16) == vid and int(parts[2], 16) == pid:
+                    return f"/dev/{entry.name}"
+            except ValueError:
+                continue
+    return None
+
+
+def diagnose(vid: int, pid: int) -> Tuple[str, Optional[str]]:
+    """Why can we not talk to the adapter? Returns (state, device path).
+
+    States:
+      "ok"          the node exists and we can read and write it
+      "permission"  it is there, but not ours to open -- the udev rule is
+                    missing, which is the usual first-run failure
+      "missing"     no such device; not plugged in, or not a GLM adapter
+    """
+    path = find_hidraw(vid, pid)
+    if path is None:
+        return "missing", None
+    if os.access(path, os.R_OK | os.W_OK):
+        return "ok", path
+    return "permission", path
+
+
+#: Written verbatim into the fix-it command, so it works regardless of where
+#: the application was installed from -- there may be no rules file on disk
+#: to point at.
+UDEV_RULE_PATH = "/etc/udev/rules.d/70-genelec-glm.rules"
+UDEV_RULE_BODY = """\
+# Genelec GLM network adapter (Gnet USB adapter)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1781", ATTRS{idProduct}=="0e39", \
+MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1781", ATTRS{idProduct}=="0e39", \
+MODE="0660", GROUP="plugdev", TAG+="uaccess"
+"""
+
+
+def udev_fix_command() -> str:
+    """A self-contained shell snippet the user can paste to fix permissions.
+
+    Deliberately writes the rule inline rather than copying a packaged file:
+    the same text then works for a .deb, an AppImage, a tarball or a git
+    checkout, none of which put the rule in the same place.
+    """
+    return (f"sudo tee {UDEV_RULE_PATH} > /dev/null <<'EOF'\n"
+            f"{UDEV_RULE_BODY}"
+            f"EOF\n"
+            f"sudo udevadm control --reload-rules && sudo udevadm trigger")
 
 
 def firmware_version(software: str) -> Optional[str]:

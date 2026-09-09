@@ -42,19 +42,65 @@ to the current level before it can be heard.
 
 ## Install
 
-The GLM adapter's HID device is root-only by default:
+### Debian / Ubuntu (recommended)
 
-    sudo install -m 0644 packaging/udev/70-genelec-glm.rules /etc/udev/rules.d/
-    sudo udevadm control --reload-rules && sudo udevadm trigger
+Download the `.deb` from
+[Releases](https://github.com/AtmanActive/GenlcUI/releases) and:
 
-Then:
+    sudo apt install ./genlcui_*.deb
+
+This is the only option that installs the udev rule for you, so the adapter
+works without any further setup. Qt is bundled, so it does not depend on your
+distribution's Qt version.
+
+### AppImage
+
+    chmod +x GenlcUI-*.AppImage
+    ./GenlcUI-*.AppImage
+
+Self-contained and needs no root — but for that reason it *cannot* install the
+udev rule. On first run GenlcUI will detect that the adapter is present but
+unreadable and show you the exact command to fix it.
+
+### Tarball
+
+    tar xf genlcui-*-linux-x86_64.tar.gz
+    cd genlcui-*
+    ./install.sh          # installs into ~/.local, no root
+
+### From source
 
     uv venv && uv pip install -e .
-    ./packaging/install-icons.sh      # icons + desktop entry
+    ./packaging/install-icons.sh
+    sudo install -m 0644 packaging/udev/70-genelec-glm.rules /etc/udev/rules.d/
+    sudo udevadm control --reload-rules && sudo udevadm trigger
     genlcui
 
-`install-icons.sh` matters for more than looks: KDE's tray passes icons by
-name, so the state colours only appear once the variants are installed.
+## Device permissions
+
+The GLM adapter appears as a raw HID device, which Linux restricts to root by
+default. Only the `.deb` installs the rule automatically; for every other
+format GenlcUI detects the situation and shows a dialog with the exact
+copy-pasteable commands.
+
+## Building packages
+
+    ./packaging/build-all.sh
+
+Produces a `.deb`, an AppImage and a tarball in `dist/`. Everything is built
+from one bundle containing its own CPython and a pruned PySide6 (650 MB of Qt
+reduced to ~208 MB by dropping WebEngine, Quick3D, Multimedia and friends).
+`verify-bundle.sh` runs against the pruned tree before anything is packaged,
+because a missing Qt library is a crash in a shipped binary rather than a test
+failure. The AppImage step additionally needs `appimagetool` on PATH.
+
+### Releases
+
+Releases are cut by hand from the **Build and draft release** workflow under
+the repository's Actions tab. It runs the test suite, builds all three
+artefacts, checks none are missing, and opens a **draft** release with
+checksums — publishing it stays a manual decision. The tag defaults to
+`v<version from genlcui/__init__.py>`.
 
 ## Protocol
 

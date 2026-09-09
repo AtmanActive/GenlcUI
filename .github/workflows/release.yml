@@ -1,0 +1,164 @@
+name: Build and draft release
+
+# Manual only. Building a release is a decision, not something that should
+# happen because a commit landed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create (default: v<version from genlcui/__init__.py>)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark the draft as a pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write        # needed to create the draft release
+
+jobs:
+  build:
+    name: Build artefacts
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          # libhidapi is needed to `import hid` at all. The rest is what Qt
+          # wants even under the offscreen platform, which the bundle
+          # verification and the test suite both use.
+          sudo apt-get install -y --no-install-recommends \
+            libhidapi-hidraw0 \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libfontconfig1 libfreetype6 libdbus-1-3 \
+            libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xkb1 \
+            xz-utils desktop-file-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Provide the interpreter the bundle is built from
+        run: uv python install 3.12
+
+      - name: Run the test suite
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e '.[dev]'
+          QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
+
+      - name: Install appimagetool
+        run: |
+          url=https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo curl -fsSL -o /opt/appimagetool.AppImage "$url"
+          sudo chmod +x /opt/appimagetool.AppImage
+          # GitHub runners have no FUSE, so the tool has to unpack itself.
+          printf '#!/bin/sh\nexec /opt/appimagetool.AppImage --appimage-extract-and-run "$@"\n' \
+            | sudo tee /usr/local/bin/appimagetool >/dev/null
+          sudo chmod +x /usr/local/bin/appimagetool
+
+      - name: Build every artefact
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./packaging/build-all.sh
+
+      - name: Check every artefact was produced
+        run: |
+          # build-all.sh tolerates a missing appimagetool so it stays usable
+          # on a developer machine. In CI a missing artefact must fail the
+          # run rather than quietly ship an incomplete release.
+          missing=0
+          for pattern in 'dist/genlcui_*.deb' \
+                         'dist/genlcui-*-linux-x86_64.tar.gz' \
+                         'dist/GenlcUI-*-x86_64.AppImage'; do
+            # shellcheck disable=SC2086
+            if ! ls $pattern >/dev/null 2>&1; then
+              echo "::error::no artefact matching $pattern"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Determine the tag
+        id: meta
+        run: |
+          version="$(cat build/VERSION)"
+          tag="${{ inputs.tag }}"
+          [ -z "$tag" ] && tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Version $version, tag $tag"
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: genlcui-${{ steps.meta.outputs.version }}
+          path: dist/*
+          retention-days: 14
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading into it."
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+
+          notes="$(cat <<'NOTES'
+          ## Install
+
+          **Debian / Ubuntu** — the only option that installs the udev rule
+          for you, so the adapter works with no further setup:
+
+          ```
+          sudo apt install ./genlcui_VERSION_amd64.deb
+          ```
+
+          **AppImage** — self-contained, no root. It cannot install the udev
+          rule, so on first run GenlcUI will detect that the adapter is
+          present but unreadable and show you the exact command to fix it.
+
+          ```
+          chmod +x GenlcUI-VERSION-x86_64.AppImage
+          ./GenlcUI-VERSION-x86_64.AppImage
+          ```
+
+          **Tarball** — unpack and run `./install.sh` to install into
+          `~/.local` without root.
+
+          Qt is bundled in all three, so none of them depend on your
+          distribution's Qt version.
+
+          Verify downloads against `SHA256SUMS`.
+          NOTES
+          )"
+          notes="${notes//VERSION/$VERSION}"
+
+          flags="--draft"
+          [ "$PRERELEASE" = "true" ] && flags="$flags --prerelease"
+
+          # shellcheck disable=SC2086
+          gh release create "$TAG" $flags \
+            --title "GenlcUI $VERSION" \
+            --notes "$notes" \
+            dist/*
+
+          echo "Draft release $TAG created. Review and publish it manually."

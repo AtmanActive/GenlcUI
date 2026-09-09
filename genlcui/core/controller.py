@@ -224,7 +224,13 @@ class Controller:
         try:
             transport = Transport(self._open_device())
         except Exception as exc:  # noqa: BLE001
+            # Distinguish "not plugged in" from "plugged in but not ours to
+            # open". The second is the usual first-run failure and has a
+            # precise fix, so it deserves better than a generic error.
+            state, path = hidinfo.diagnose(GLM_VID, GLM_PID)
             self._emit("disconnected", str(exc))
+            if state == "permission":
+                self._emit("permission_denied", path)
             return None
         session = Session(transport, on_event=self._emit)
         details = hidinfo.enumerate_adapter(GLM_VID, GLM_PID)

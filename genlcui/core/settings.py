@@ -63,6 +63,10 @@ class Settings:
     wake_on_start: bool = False
 
     # Appearance
+    # Off by default and never enabled automatically: registering shortcuts
+    # with someone's desktop uninvited is not ours to decide.
+    kde_shortcuts: bool = False
+
     theme_mode: str = "system"        # system | light | dark
     theme_name: str = "Slate"
     text_size: str = "default"

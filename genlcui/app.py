@@ -16,6 +16,7 @@ from . import APP_TITLE, __version__
 from .core.settings import Settings
 from .resources import app_icon
 from .ui.bridge import Bridge
+from .ui.ipc import ControlService, KdeShortcuts, publish
 from .ui.tray import Tray
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,22 @@ def main(argv=None) -> int:
 
     window = engine.rootObjects()[0]
     tray = Tray(bridge, window) if has_tray else None
+
+    # The control interface is always published; it is inert until called.
+    # KDE shortcut registration is separate and stays off until the user asks
+    # for it -- see Settings.kde_shortcuts.
+    service = ControlService(bridge)
+    publish(service)
+    shortcuts = KdeShortcuts(service)
+    bridge._shortcuts = shortcuts
+    if settings.kde_shortcuts:
+        if not shortcuts.register():
+            logger.warning("global shortcuts were enabled but KDE's service "
+                           "did not respond")
+
+    bridge.showWindowRequested.connect(
+        lambda: (window.show(), window.raise_(), window.requestActivate()))
+    bridge.hideWindowRequested.connect(window.hide)
 
     if has_tray and settings.start_minimised and "--show" not in argv:
         window.hide()

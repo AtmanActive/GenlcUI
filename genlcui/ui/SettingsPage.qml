@@ -183,58 +183,85 @@ Item {
                     label: "Start automatically at login"
                     hint: "The knob works with or without this running; " +
                           "autostart just keeps presets and mute to hand."
-                    // The stock Switch draws itself from the Qt style, not
-                    // from our palette, so on a light theme it stayed dark on
-                    // near-white and was barely visible. Drawn here instead.
-                    Switch {
-                        id: autostartSwitch
+                    ThemedSwitch {
                         checked: bridge.autostartEnabled
                         onToggled: bridge.setAutostart(checked)
                         ToolTip.visible: hovered
                         ToolTip.delay: 500
                         ToolTip.text: "Start " + bridge.appName
                                       + " automatically when you log in"
-                        HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    }
+                }
 
-                        implicitWidth: track.implicitWidth
-                        implicitHeight: Math.max(28, t.fs(28))
+                Rectangle { Layout.fillWidth: true; height: 1; color: t.line }
 
-                        indicator: Rectangle {
-                            id: track
-                            implicitWidth: Math.max(46, t.fs(46))
-                            implicitHeight: Math.max(26, t.fs(26))
-                            anchors.verticalCenter: parent.verticalCenter
-                            radius: height / 2
-                            color: autostartSwitch.checked ? t.accent : t.line
-                            border.width: 1
-                            border.color: autostartSwitch.checked
-                                          ? t.accent
-                                          : (t.isDark ? Qt.lighter(t.line, 1.4)
-                                                      : Qt.darker(t.line, 1.25))
-                            Behavior on color { ColorAnimation { duration: 130 } }
+                SectionLabel { text: "GLOBAL SHORTCUTS" }
 
-                            Rectangle {
-                                id: knob
-                                width: parent.height - 6
-                                height: width
-                                radius: width / 2
-                                y: 3
-                                x: autostartSwitch.checked
-                                   ? parent.width - width - 3 : 3
-                                color: autostartSwitch.checked
-                                       ? "#ffffff" : t.surface
-                                border.width: 1
-                                border.color: Qt.rgba(0, 0, 0,
-                                              t.isDark ? 0.45 : 0.25)
-                                Behavior on x {
-                                    NumberAnimation {
-                                        duration: 130
-                                        easing.type: Easing.OutCubic
-                                    }
-                                }
+                Row_ {
+                    label: "Register shortcuts with KDE"
+                    hint: bridge.kdeShortcutsAvailable
+                          ? "Off by default: nothing is added to your desktop "
+                            + "until you ask. Turning this on registers the "
+                            + "actions below with no keys bound and opens "
+                            + "KDE's shortcut editor so you can assign them. "
+                            + "Turning it off removes them again."
+                          : "KDE's global shortcut service is not running on "
+                            + "this session."
+                    ThemedSwitch {
+                        enabled: bridge.kdeShortcutsAvailable
+                        checked: bridge.kdeShortcutsEnabled
+                        onToggled: bridge.setKdeShortcuts(checked)
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: bridge.kdeShortcutsAvailable
+                            ? "Adds these actions to System Settings → Shortcuts"
+                            : "Requires KDE Plasma"
+                    }
+                }
+
+                Flow {
+                    Layout.fillWidth: true
+                    visible: bridge.kdeShortcutsEnabled
+                    spacing: 6
+                    Repeater {
+                        model: bridge.shortcutActions
+                        delegate: Rectangle {
+                            required property var modelData
+                            radius: 4
+                            color: t.surface
+                            border.color: t.line
+                            implicitWidth: chip.implicitWidth + 16
+                            implicitHeight: chip.implicitHeight + 8
+                            Label {
+                                id: chip
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                color: t.dim
+                                font.pixelSize: t.fs(11)
                             }
                         }
-                        contentItem: Item { }
+                    }
+                }
+
+                Button {
+                    id: editorButton
+                    Layout.alignment: Qt.AlignLeft
+                    visible: bridge.kdeShortcutsEnabled
+                    implicitWidth: Math.max(150, t.fs(158))
+                    implicitHeight: Math.max(30, t.fs(32))
+                    onClicked: bridge.openShortcutEditor()
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    background: Rectangle {
+                        radius: 6
+                        color: editorButton.pressed ? t.line : t.surface
+                        border.color: t.line
+                    }
+                    contentItem: Label {
+                        text: "Open shortcut editor"
+                        color: t.text
+                        font.pixelSize: t.fs(12)
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
                     }
                 }
 

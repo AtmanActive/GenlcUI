@@ -48,6 +48,10 @@ class Bridge(QObject):
     presetCaptured = Signal(int, float, bool)   # index, dB, exceedsCeiling
     ceilingCaptured = Signal(float)
     repairRequested = Signal()
+    showWindowRequested = Signal()
+    permissionProblem = Signal(str)      # the device path we cannot open
+    hideWindowRequested = Signal()
+    shortcutsChanged = Signal()
     appearanceChanged = Signal()
     settingsChanged = Signal()
 
@@ -63,6 +67,8 @@ class Bridge(QObject):
         self._muted = False
         self._asleep = False
         self._identifying = ""
+        self._shortcuts = None        # set by app.py once D-Bus is up
+        self._permission_warned = False
         self._status = "Starting…"
         self._active_preset = -1
         self._speakers: List[Dict[str, Any]] = []
@@ -106,6 +112,10 @@ class Bridge(QObject):
         elif name == "volume_set":
             self._volume_db = payload
             self.volumeChanged.emit()
+        elif name == "permission_denied":
+            if not self._permission_warned:
+                self._permission_warned = True    # once per run, not per retry
+                self.permissionProblem.emit(str(payload or ""))
         elif name == "identifying":
             self._identifying = "" if payload is None else str(payload)
             self.speakersChanged.emit()
@@ -381,6 +391,75 @@ class Bridge(QObject):
                                lambda s: setattr(s, "max_volume_db", knob))
         self.settingsChanged.emit()
         self.ceilingCaptured.emit(knob)
+
+    # -- global shortcuts ------------------------------------------------
+
+    @Property(bool, notify=shortcutsChanged)
+    def kdeShortcutsEnabled(self) -> bool:
+        return self._settings.kde_shortcuts
+
+    @Property(bool, constant=True)
+    def kdeShortcutsAvailable(self) -> bool:
+        from .ipc import KdeShortcuts
+
+        return KdeShortcuts.available()
+
+    @Property("QVariantList", constant=True)
+    def shortcutActions(self):
+        from .ipc import ACTIONS
+
+        return [{"id": method, "label": label} for method, label in ACTIONS]
+
+    @Slot(bool)
+    def setKdeShortcuts(self, enabled: bool) -> None:
+        """Register or remove the KDE shortcut actions.
+
+        Enabling also opens the shortcuts editor: registration deliberately
+        binds no keys, so without that the actions would exist but appear to
+        do nothing.
+        """
+        if self._shortcuts is None:
+            self.errorRaised.emit("Global shortcuts are not available here")
+            return
+
+        try:
+            ok = (self._shortcuts.register() if enabled
+                  else self._shortcuts.unregister())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("global shortcut toggle failed")
+            self.errorRaised.emit(f"Global shortcuts: {exc}")
+            self.shortcutsChanged.emit()
+            return
+        if not ok:
+            self.errorRaised.emit(
+                "KDE's shortcut service did not respond")
+            self.shortcutsChanged.emit()
+            return
+
+        self._settings.kde_shortcuts = bool(enabled)
+        self._settings.save()
+        self.shortcutsChanged.emit()
+        if enabled:
+            self._shortcuts.open_editor()
+
+    @Slot()
+    def openShortcutEditor(self) -> None:
+        if self._shortcuts is not None:
+            self._shortcuts.open_editor()
+
+    @Property(str, constant=True)
+    def udevFixCommand(self) -> str:
+        from ..core.hidinfo import udev_fix_command
+
+        return udev_fix_command()
+
+    @Slot(str)
+    def copyToClipboard(self, text: str) -> None:
+        from PySide6.QtGui import QGuiApplication
+
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
 
     @Property(bool, constant=True)
     def trayAvailable(self) -> bool:

@@ -97,6 +97,83 @@ ApplicationWindow {
         onAccepted: bridge.quitApplication()
     }
 
+    // Shown once per run when the adapter is present but unreadable -- the
+    // usual first-run state, and one with an exact fix.
+    ThemedDialog {
+        id: permissionDialog
+        width: 520
+        title: "Cannot reach the GLM adapter"
+        property string devicePath: ""
+        standardButtons: Dialog.Close
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: t.text
+                font.pixelSize: t.fs(13)
+                text: "The adapter is plugged in"
+                    + (permissionDialog.devicePath
+                       ? " at " + permissionDialog.devicePath : "")
+                    + ", but this account is not allowed to open it. Linux "
+                    + "restricts raw USB devices to root by default.\n\n"
+                    + "Paste this into a terminal to grant access, then "
+                    + "unplug and replug the adapter:"
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: commandText.implicitHeight + 20
+                radius: 6
+                color: t.isDark ? Qt.darker(t.bg, 1.25) : Qt.darker(t.bg, 1.04)
+                border.color: t.line
+                TextEdit {
+                    id: commandText
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    text: bridge.udevFixCommand
+                    color: t.text
+                    font.family: "monospace"
+                    font.pixelSize: t.fs(11)
+                    wrapMode: TextEdit.NoWrap
+                    readOnly: true
+                    selectByMouse: true
+                }
+            }
+            Button {
+                id: copyButton
+                Layout.alignment: Qt.AlignLeft
+                implicitWidth: Math.max(130, t.fs(136))
+                implicitHeight: Math.max(30, t.fs(32))
+                onClicked: {
+                    bridge.copyToClipboard(bridge.udevFixCommand)
+                    toast.show("Commands copied to the clipboard", false)
+                }
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                background: Rectangle {
+                    radius: 6
+                    color: copyButton.pressed ? t.line : t.surface
+                    border.color: t.line
+                }
+                contentItem: Label {
+                    text: "Copy commands"
+                    color: t.text
+                    font.pixelSize: t.fs(12)
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: t.dim
+                font.pixelSize: t.fs(11)
+                text: "Nothing else needs changing, and this only has to be "
+                    + "done once per machine."
+            }
+        }
+    }
+
     Connections {
         target: bridge
         function onPresetCaptured(index, db, exceeds) {
@@ -107,6 +184,10 @@ ApplicationWindow {
             toast.show("Limit set to " + t.fmtDb(db), false)
         }
         function onErrorRaised(message) { toast.show(message) }
+        function onPermissionProblem(devicePath) {
+            permissionDialog.devicePath = devicePath
+            permissionDialog.open()
+        }
     }
 
     Rectangle {
