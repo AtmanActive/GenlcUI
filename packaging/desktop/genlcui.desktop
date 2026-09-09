@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Genelec
+Name=GenlcUI
 GenericName=Studio Monitor Control
 Comment=Control Genelec SAM monitors through the GLM adapter
 Exec=genlcui

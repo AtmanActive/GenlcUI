@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 MAX_ADDRESS = 128
 
+# The shortest possible tag-value item: one tag byte plus one value byte.
+# Anything below this is a different kind of reply, not a malformed one.
+MIN_TLV_PAYLOAD = 2
+
 # Agreed with the user: -30 dBFS is the loudest they ever tolerate, and -50
 # is a comfortable default. The ceiling applies to every write.
 SAFETY_MAX_DB = -30.0
@@ -89,6 +93,18 @@ class Session:
         self._last_rediscover = 0.0
         self._busy = False        # a disruptive operation owns the volume
 
+        # Sleep has to be a state the whole loop respects, not just a
+        # broadcast. STAY_ONLINE keeps monitors online *by design*, and RACE
+        # is a roll-call they answer -- so continuing either after a shutdown
+        # wakes the speakers straight back up, which is exactly what happened.
+        self.asleep = False
+
+        # serial -> monotonic deadline at which the LED goes back to normal.
+        # Identify is timed here rather than with a sleep because the bus
+        # thread must keep the heartbeat going: blocking it for five seconds
+        # would expire every address lease.
+        self._identify_until: Dict[int, float] = {}
+
     # -- events ----------------------------------------------------------
 
     def _emit(self, name: str, payload: object = None) -> None:
@@ -109,6 +125,8 @@ class Session:
         Without this, addresses stop answering after ~2-3s. Cheap enough to
         call on every loop iteration.
         """
+        if self.asleep:
+            return
         now = time.monotonic()
         if force or now - self._last_heartbeat >= cid.HEARTBEAT_INTERVAL_S:
             try:
@@ -144,6 +162,9 @@ class Session:
         immediately re-discoverable (measured T2 ~= 0s), and one that is still
         assigned simply will not answer RACE.
         """
+        if self.asleep:
+            # RACE would wake them. Discovery resumes on the next wake().
+            return []
         self.heartbeat(force=True)
         # Only monitors still holding a live lease occupy an address. Counting
         # offline ones too would push each recovery cycle higher (2,3,4 ->
@@ -259,7 +280,7 @@ class Session:
             if previous != status.volume_db:
                 # The pot moved (or this is the first reading). Software
                 # writes cannot move it, so this is the user's hand.
-                if self.follow_knob and not self._busy:
+                if self.follow_knob and not self._busy and not self.asleep:
                     # Deliberately unclamped: the ceiling guards programmatic
                     # writes, which have no physical act behind them. Clamping
                     # the knob would make the hardware feel broken above the
@@ -274,6 +295,9 @@ class Session:
 
     def poll_monitor(self, monitor: Monitor) -> Optional[Monitor]:
         """Read one monitor. Returns None when it had nothing new to report."""
+        if self.asleep:
+            return None
+
         def go():
             return self.transport.request(Request(monitor.address, cid.CID_POLL))
 
@@ -281,6 +305,18 @@ class Session:
         if resp.is_empty_ack:
             # Rate limit, not a dropout: keep the previous reading.
             return None
+
+        if len(resp.payload) < MIN_TLV_PAYLOAD:
+            # Intact (the CRC passed) but too short to be tag-value data: a
+            # tag needs at least one value byte after it. Freshly woken
+            # monitors answer a poll with a short status byte before they
+            # have measurements to report. Not an error, and not a desync --
+            # a desync hands us someone else's *well formed* payload, which
+            # is caught below.
+            logger.debug("%s: short poll reply %r, no measurements yet",
+                         monitor, resp.payload)
+            return None
+
         try:
             status = decode_monitor_status(resp.payload)
         except ProtocolError:
@@ -349,8 +385,13 @@ class Session:
         ceiling = self.max_volume_db if clamp else VOLUME_MAX_DB
         db = max(VOLUME_MIN_DB, min(ceiling, float(db)))
         self.volume_db = db
-        if not _keep_mute:
+        if not _keep_mute and self.muted:
+            # Any level write cancels a mute -- including the knob mirror.
+            # This has to be announced: silently flipping the flag left the
+            # UI showing MUTED after the knob had already taken the level
+            # back, because nothing told it otherwise.
             self.muted = False
+            self._emit("mute_changed", False)
         request = Request(BROADCAST_ADDR, cid.CID_VOLUME_GLM,
                           db_to_sint24(db).to_bytes(3, "big", signed=True))
         self.transport.send(request)
@@ -378,6 +419,8 @@ class Session:
 
         intended = self.volume_db
         self._busy = True
+        self.asleep = False          # re-enables the heartbeat and discovery
+        self._emit("sleep_changed", False)
         try:
             self._write_volume(SAFE_DUCK_DB)
             for data in (bytes([3, 0x7F]), bytes([3, 1])):
@@ -438,6 +481,11 @@ class Session:
             self._busy = False
         for monitor in self.monitors.values():
             monitor.online = False
+        # Set last: heartbeat and discovery check this, and both must stay
+        # quiet from here until the user asks for a wake.
+        self.stop_identify()
+        self.asleep = True
+        self._emit("sleep_changed", True)
         self._emit("shutdown", None)
 
     def clear_monitor_state(self, monitor: Monitor) -> None:
@@ -455,8 +503,64 @@ class Session:
         self._emit("monitor_status", monitor)
 
     def clear_all_state(self) -> None:
+        self._identify_until.clear()
         for monitor in self.monitors.values():
             self.clear_monitor_state(monitor)
+
+    # -- identify --------------------------------------------------------
+    #
+    # The only LED control we have is CID_BYPASS_QUERY, and its "red" value
+    # (0x02) also freezes that monitor's volume stage -- see commands.py. So
+    # identify is deliberately: one speaker at a time, time limited, restored
+    # by the bus loop rather than by a caller that might go away, and cleared
+    # on shutdown. A speaker left in this state ignores volume changes.
+
+    def start_identify(self, serial: int, seconds: float) -> bool:
+        """Flag one monitor's LED for `seconds`. Returns False if unknown."""
+        monitor = self.monitors.get(serial)
+        if monitor is None:
+            return False
+        self.stop_identify()          # never leave two speakers flagged
+        try:
+            self._with_recovery(lambda: self.transport.request(Request(
+                monitor.address, cid.CID_BYPASS_QUERY,
+                bytes((cid.STATE_IDENTIFY,)))))
+        except (ProtocolError, TransportError):
+            logger.warning("identify failed for %s", monitor, exc_info=True)
+            return False
+        self._identify_until[serial] = time.monotonic() + seconds
+        self._emit("identifying", serial)
+        return True
+
+    def stop_identify(self, serial: Optional[int] = None) -> None:
+        """Return flagged monitors to normal. All of them when serial is None."""
+        targets = ([serial] if serial is not None
+                   else list(self._identify_until))
+        for target in targets:
+            self._identify_until.pop(target, None)
+            monitor = self.monitors.get(target)
+            if monitor is None:
+                continue
+            try:
+                self.clear_monitor_state(monitor)
+            except (ProtocolError, TransportError):
+                logger.warning("could not clear identify on %s", monitor,
+                               exc_info=True)
+        if targets:
+            self._emit("identifying", None)
+
+    def service_identify(self) -> None:
+        """Restore any monitor whose identify window has elapsed.
+
+        Called from the bus loop, so the restore happens even if whoever
+        started it has gone away.
+        """
+        if not self._identify_until:
+            return
+        now = time.monotonic()
+        for serial, deadline in list(self._identify_until.items()):
+            if now >= deadline:
+                self.stop_identify(serial)
 
     # -- mute ------------------------------------------------------------
     #
@@ -487,3 +591,15 @@ class Session:
     def toggle_mute(self) -> bool:
         self.unmute() if self.muted else self.mute()
         return self.muted
+
+    def release_to_knob(self) -> float:
+        """Return the level to wherever the physical knob is pointing.
+
+        The resting state of the system. Presets and mute are temporary
+        overrides on top of it, so cancelling one lands back here.
+        """
+        self.muted = False
+        target = (self.adapter.knob_db if self.adapter.knob_db is not None
+                  else self.default_volume_db)
+        self._emit("mute_changed", False)
+        return self.set_volume(target, clamp=False)

@@ -58,6 +58,25 @@ no physical act behind them; the pot's position is one the user just chose and
 heard. Clamping it would make the hardware feel broken above the limit, and
 would be a regression from how the system behaves with no software running.
 
+### Presets and mute are one exclusive group
+
+The four presets and mute behave as five mutually exclusive toggles over a
+resting state:
+
+- **Nothing selected** means the knob is in charge. This is the resting
+  state, and the level tracks the pot.
+- **Selecting one** overrides the knob until it moves.
+- **Clicking the selected one again** cancels it and returns to the knob's
+  current position.
+- **Selecting another** cancels the first: mute drops an active preset, a
+  preset drops mute.
+- **Touching the knob** cancels whatever is selected. The hand on the
+  hardware outranks every software override.
+
+Because mute is part of the group, unmuting returns to the knob rather than
+to a preset that was active before the mute. That follows from the exclusion
+rule: selecting mute already cancelled the preset.
+
 ## Volume safety ceiling
 
 A configurable ceiling (default **-30 dBFS**, the loudest the author
@@ -93,7 +112,18 @@ UI ordering, names and per-speaker settings must never depend on them.
 
 ## Process
 
-The app stays resident (tray icon) because it must: the keepalive heartbeat
-that holds the address leases has to run continuously, and the HID device is
-exclusive-open. A connect-on-demand design would find its addresses expired
-every time.
+The app stays resident (tray icon) *while it is running*: the keepalive
+heartbeat that holds the address leases has to run continuously, and the HID
+device is exclusive-open, so a connect-on-demand design would find its
+addresses expired every time.
+
+That is a constraint on how the application is structured, **not** a claim
+that the speakers need it. The GLM adapter is the standalone master: with
+GenlcUI closed, the knob controls volume exactly as it always did. Running
+GenlcUI takes that over and hands it back on exit -- including on a crash,
+since the bus is released when the process dies.
+
+So the app is a convenience, never a dependency. Nothing it does should make
+the system worse off than not running it at all, which is also why the knob
+mirror is unclamped: clamping would make the hardware behave differently under
+our management than without it.

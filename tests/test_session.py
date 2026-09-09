@@ -31,18 +31,46 @@ def packetise(msg: bytes) -> bytes:
 
 
 class FakeHid:
-    """Scripted HID device. `replies` is consumed in order."""
+    """Scripted HID device.
 
-    def __init__(self, replies=None):
+    Models the real one closely enough to matter: a reply only becomes
+    readable once a request has been written. Handing out queued replies on
+    any read would hide exactly the bug this fake exists to catch -- the
+    transport drains before every request, and a fake that answers an
+    unprompted read would have that drain swallow the next real reply.
+
+    `unsolicited` is read back regardless, modelling a reply to one of the
+    fire-and-forget broadcasts (volume, keepalive, wakeup).
+    """
+
+    def __init__(self, replies=None, unsolicited=None):
         self.replies = list(replies or [])
+        self.unsolicited = list(unsolicited or [])
         self.written = []
         self.closed = False
+        self._armed = False
+
+    #: Commands the real adapter does not answer. The session sends these
+    #: fire-and-forget via Transport.send(); arming for them would make the
+    #: fake produce replies no hardware produces, and the pre-request drain
+    #: would then eat the next real one.
+    NO_REPLY = {0x1F, 0x04, 0x3A}      # VOLUME_GLM, STAY_ONLINE, WAKEUP
 
     def write(self, data):
-        self.written.append(bytes(data))
+        data = bytes(data)
+        self.written.append(data)
+        # data = [0x00, 0x80 + len] + address + command + ...
+        if len(data) > 3 and data[3] not in self.NO_REPLY:
+            self._armed = True
         return len(data)
 
     def read(self, size, timeout=None):
+        if self.unsolicited:
+            item = self.unsolicited.pop(0)
+            return packetise(item) if item is not None else b""
+        if not self._armed:
+            return b""
+        self._armed = False
         if not self.replies:
             return b""
         item = self.replies.pop(0)
@@ -440,16 +468,24 @@ def test_rediscovery_is_rate_limited():
     assert races_total == races_after_first, "re-discovered inside the cooldown"
 
 
-def test_decode_failure_resyncs_the_transport():
-    """A wrong-device reply arrives after the transport has already returned,
-    so its own resync never runs and the desync would persist."""
-    hid, session, _ = make([frame(b"\x84\x01")])   # 16-bit tag, 1 byte of value
+def test_stale_reply_does_not_become_the_next_answer():
+    """The real failure: replies to fire-and-forget broadcasts sat in the
+    queue and were handed back as the next request's answer, shifting every
+    request/response pair from then on."""
+    hid = FakeHid(replies=[frame(bytes([0x41, 0x2D]))],
+                  unsolicited=[frame(b"\x99\x99")])   # junk left by a broadcast
+    session = Session(Transport(hid))
     monitor = Monitor(serial=1, address=2)
     session.monitors[1] = monitor
-    before = len(hid.replies)
+    assert session.poll_monitor(monitor).temperature_c == 45
+
+
+def test_decode_failure_drains_before_the_next_request():
+    hid, session, _ = make([frame(b"\x84\x01")])   # 16-bit tag, one byte left
+    monitor = Monitor(serial=1, address=2)
+    session.monitors[1] = monitor
     with pytest.raises(ProtocolError):
         session.poll_monitor(monitor)
-    assert len(hid.replies) <= before      # drain ran
 
 
 def test_knob_is_not_mirrored_during_a_disruptive_operation():
@@ -503,3 +539,197 @@ def test_discovery_during_a_guarded_operation_does_not_break_the_duck():
     levels = [w for w in hid.written[marker:]
               if len(w) > 3 and w[3] == cid.CID_VOLUME_GLM]
     assert not levels, "asserted a level while silence was being held"
+
+
+# -- sleep ---------------------------------------------------------------
+#
+# Regression coverage: after a shutdown the app kept broadcasting STAY_ONLINE
+# and running RACE discovery, both of which the speakers answer -- so they
+# woke themselves back up a few seconds later.
+
+def test_shutdown_marks_the_session_asleep():
+    _, session, events = make()
+    session.shutdown()
+    assert session.asleep
+    assert ("sleep_changed", True) in events
+
+
+def test_no_keepalive_while_asleep():
+    """STAY_ONLINE keeps monitors online by design."""
+    hid, session, _ = make()
+    session.shutdown()
+    marker = len(hid.written)
+    for _ in range(10):
+        session.heartbeat(force=True)
+    sent = [c for _, c in hid.sent_requests()[marker:]]
+    assert cid.CID_STAY_ONLINE not in sent
+
+
+def test_no_discovery_while_asleep():
+    """RACE is a roll-call the speakers answer, which wakes them."""
+    hid, session, _ = make([frame(b"\x00\x00\x09"), frame(b"\x02"), None])
+    session.shutdown()
+    marker = len(hid.written)
+    assert session.discover() == []
+    sent = [c for _, c in hid.sent_requests()[marker:]]
+    assert cid.CID_RACE not in sent
+
+
+def test_no_monitor_polling_while_asleep():
+    hid, session, _ = make([frame(bytes([0x41, 0x25]))])
+    monitor = Monitor(serial=1, address=2)
+    session.monitors[1] = monitor
+    session.shutdown()
+    marker = len(hid.written)
+    assert session.poll_monitor(monitor) is None
+    assert len(hid.written) == marker
+
+
+def test_knob_is_not_mirrored_while_asleep():
+    """Writing volume to sleeping speakers is both pointless and a wake risk."""
+    hid, session, _ = make([_knob_frame(-40.0)])
+    session.shutdown()
+    marker = len(hid.written)
+    session.poll_adapter()
+    sent = [c for _, c in hid.sent_requests()[marker:]]
+    assert cid.CID_VOLUME_GLM not in sent
+
+
+def test_wake_clears_the_asleep_state():
+    _, session, events = make([None] * 40)
+    session.shutdown()
+    session.wake(-50.0, settle_s=0.05)
+    assert not session.asleep
+    assert ("sleep_changed", False) in events
+
+
+def test_wake_after_sleep_can_discover_again():
+    hid, session, _ = make([frame(b"\x00\x00\x09"), frame(b"\x02"), None] * 20)
+    session.shutdown()
+    session.wake(-50.0, settle_s=0.3)
+    sent = [c for _, c in hid.sent_requests()]
+    assert cid.CID_RACE in sent
+
+
+def test_short_poll_reply_is_not_an_error():
+    """A freshly woken monitor answers with a status byte before it has
+    measurements. The CRC passes, so this is an intact reply that simply is
+    not tag-value data -- reporting it as a protocol error was wrong."""
+    hid, session, events = make([frame(b"\x06")])
+    monitor = Monitor(serial=1, address=2, temperature_c=37)
+    session.monitors[1] = monitor
+    assert session.poll_monitor(monitor) is None
+    assert monitor.temperature_c == 37          # previous reading retained
+    assert not [e for e in events if e[0] == "error"]
+
+
+def test_malformed_long_payload_is_still_an_error():
+    """A desync hands us a well-formed payload meant for someone else. That
+    must stay loud, or the resync never happens."""
+    hid, session, _ = make([frame(b"\x84\x01\x02\x84")])   # truncated 16-bit tag
+    monitor = Monitor(serial=1, address=2)
+    session.monitors[1] = monitor
+    with pytest.raises(ProtocolError):
+        session.poll_monitor(monitor)
+
+
+def test_moving_the_knob_announces_the_unmute():
+    """The knob mirror cancels a mute, and the UI has to be told: silently
+    clearing the flag left MUTED on screen after the level had come back."""
+    hid, session, events = make([_knob_frame(-60.0), _knob_frame(-55.0)])
+    session.poll_adapter()
+    session.mute()
+    events.clear()
+    session.poll_adapter()                      # knob moves
+    assert not session.muted
+    assert ("mute_changed", False) in events
+
+
+def test_any_level_write_announces_the_unmute():
+    _, session, events = make()
+    session.mute()
+    events.clear()
+    session.set_volume(-45.0)
+    assert ("mute_changed", False) in events
+
+
+def test_unmute_is_not_announced_when_it_was_never_muted():
+    """Otherwise every knob movement emits a redundant event."""
+    _, session, events = make()
+    session.set_volume(-45.0)
+    assert not [e for e in events if e[0] == "mute_changed"]
+
+
+# -- identify ------------------------------------------------------------
+#
+# The LED command also freezes that monitor's volume stage, so the restore
+# has to be guaranteed rather than best effort.
+
+def test_identify_sets_the_led_and_records_a_deadline():
+    hid, session, events = make([frame(b"")])
+    session.monitors[7] = Monitor(serial=7, address=2)
+    assert session.start_identify(7, seconds=5.0)
+    payload = hid.written[-1][2:]
+    assert payload[1] == cid.CID_BYPASS_QUERY
+    assert payload[2] == cid.STATE_IDENTIFY == 0x02
+    assert 7 in session._identify_until
+    assert ("identifying", 7) in events
+
+
+def test_identify_restores_normal_when_the_window_elapses():
+    hid, session, _ = make([frame(b""), frame(b"")])
+    session.monitors[7] = Monitor(serial=7, address=2)
+    session.start_identify(7, seconds=0.0)      # already expired
+    session.service_identify()
+    payload = hid.written[-1][2:]
+    assert payload[2] == cid.STATE_NORMAL == 0x00
+    assert not session._identify_until
+
+
+def test_identify_does_not_block_the_bus():
+    """A five second sleep here would expire every address lease."""
+    import time as _time
+    hid, session, _ = make([frame(b"")])
+    session.monitors[7] = Monitor(serial=7, address=2)
+    started = _time.monotonic()
+    session.start_identify(7, seconds=5.0)
+    assert _time.monotonic() - started < 0.5
+
+
+def test_only_one_speaker_is_flagged_at_a_time():
+    hid, session, _ = make([frame(b"")] * 6)
+    session.monitors[7] = Monitor(serial=7, address=2)
+    session.monitors[8] = Monitor(serial=8, address=3)
+    session.start_identify(7, seconds=5.0)
+    session.start_identify(8, seconds=5.0)
+    assert set(session._identify_until) == {8}
+
+
+def test_sleeping_clears_an_active_identify():
+    """Otherwise a speaker sleeps with its volume stage frozen."""
+    hid, session, _ = make([frame(b"")] * 4)
+    session.monitors[7] = Monitor(serial=7, address=2)
+    session.start_identify(7, seconds=5.0)
+    session.shutdown()
+    assert not session._identify_until
+
+
+def test_clear_all_state_drops_identify_tracking():
+    hid, session, _ = make([frame(b"")] * 4)
+    session.monitors[7] = Monitor(serial=7, address=2)
+    session.start_identify(7, seconds=5.0)
+    session.clear_all_state()
+    assert not session._identify_until
+
+
+def test_identifying_an_unknown_speaker_is_refused():
+    _, session, _ = make()
+    assert session.start_identify(999, seconds=5.0) is False
+
+
+def test_service_identify_is_cheap_when_nothing_is_flagged():
+    hid, session, _ = make()
+    before = len(hid.written)
+    for _ in range(100):
+        session.service_identify()
+    assert len(hid.written) == before

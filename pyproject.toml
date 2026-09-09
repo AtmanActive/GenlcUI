@@ -1,6 +1,6 @@
 [project]
 name = "genlcui"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Linux desktop controller for Genelec SAM monitors via the GLM adapter"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,12 @@ dev = ["pytest>=7", "pytest-cov"]
 [project.scripts]
 genlcui = "genlcui.app:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "genlcui.__version__" }
+
+# setuptools cannot resolve `urls` dynamically, so this literal is the one
+# place the homepage is duplicated from genlcui.APP_HOMEPAGE.
+# tests/test_metadata.py asserts the two stay identical.
 [project.urls]
 Homepage = "https://github.com/AtmanActive/GenlcUI"
 

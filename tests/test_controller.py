@@ -234,3 +234,77 @@ def test_discovery_runs_periodically(tmp_path):
                         timeout=cid.DISCOVERY_INTERVAL_S * 3 + 2)
     finally:
         ctl.stop()
+
+
+# -- exclusive selection -------------------------------------------------
+#
+# The four presets and mute are one mutually exclusive group. "Nothing
+# selected" is the resting state and means the knob is in charge.
+
+def selections(events):
+    return [p for n, p in events if n == "selection_changed"]
+
+
+def armed(tmp_path):
+    ctl, settings, hid, events = make_controller(tmp_path)
+    for i in range(4):
+        settings.capture_preset(i, -60.0 + i)
+    return ctl, settings, hid, events
+
+
+def test_recalling_a_preset_selects_it(tmp_path):
+    ctl, _, _, events = armed(tmp_path)
+    ctl.recall_preset(1)
+    assert ctl.selection == ("preset", 1)
+    assert selections(events)[-1] == ("preset", 1)
+
+
+def test_clicking_the_active_preset_again_clears_it(tmp_path):
+    ctl, _, _, events = armed(tmp_path)
+    ctl.recall_preset(1)
+    ctl.recall_preset(1)
+    assert ctl.selection is None
+    assert selections(events)[-1] is None
+
+
+def test_presets_deselect_each_other(tmp_path):
+    ctl, _, _, _ = armed(tmp_path)
+    ctl.recall_preset(0)
+    ctl.recall_preset(3)
+    assert ctl.selection == ("preset", 3)
+
+
+def test_mute_deselects_an_active_preset(tmp_path):
+    ctl, _, _, _ = armed(tmp_path)
+    ctl.recall_preset(2)
+    ctl.toggle_mute()
+    assert ctl.selection == ("mute",)
+
+
+def test_a_preset_deselects_mute(tmp_path):
+    ctl, _, _, _ = armed(tmp_path)
+    ctl.toggle_mute()
+    ctl.recall_preset(0)
+    assert ctl.selection == ("preset", 0)
+
+
+def test_mute_toggles_back_to_nothing_selected(tmp_path):
+    ctl, _, _, _ = armed(tmp_path)
+    ctl.toggle_mute()
+    ctl.toggle_mute()
+    assert ctl.selection is None
+
+
+def test_moving_the_knob_clears_any_selection(tmp_path):
+    """The hand on the knob outranks every override."""
+    ctl, _, _, events = armed(tmp_path)
+    ctl.recall_preset(2)
+    ctl._emit("knob_moved", -44.0)
+    assert ctl.selection is None
+    assert selections(events)[-1] is None
+
+
+def test_recalling_an_unset_preset_changes_nothing(tmp_path):
+    ctl, settings, _, _ = make_controller(tmp_path)
+    ctl.recall_preset(3)
+    assert ctl.selection is None

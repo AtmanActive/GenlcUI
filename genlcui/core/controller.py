@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from . import commands as cid
+from . import hidinfo
 from .protocol import DeviceTimeout, ProtocolError
 from .session import Session
 from .settings import Settings
@@ -39,6 +40,10 @@ IDLE_SLEEP_S = 0.02
 # A desynchronised bus produces a decode error on every poll. Surfacing each
 # one floods the log and the UI with the same message many times a second.
 ERROR_REPEAT_S = 5.0
+
+# How long a speaker's LED stays flagged during identify. Kept short: the
+# command that lights it also freezes that monitor's volume stage.
+IDENTIFY_SECONDS = 5.0
 
 
 @dataclass
@@ -63,6 +68,11 @@ class Controller:
         self._session: Optional[Session] = None
         self.connected = False
         self._recent_errors: dict = {}
+
+        # The four presets and mute form one mutually exclusive group. None
+        # selected means "following the knob", which is the resting state --
+        # so cancelling any of them lands back on the knob's position.
+        self.selection = None        # None | ("preset", int) | ("mute",)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -106,13 +116,25 @@ class Controller:
     def set_volume(self, db: float) -> None:
         self.submit("set_volume", lambda s: s.set_volume(db))
 
+    def _set_selection(self, selection) -> None:
+        self.selection = selection
+        self._emit("selection_changed", selection)
+
+    def clear_selection(self) -> None:
+        """Drop any preset or mute and go back to following the knob."""
+        self._set_selection(None)
+        self.submit("release_to_knob", lambda s: s.release_to_knob())
+
     def recall_preset(self, index: int) -> None:
         preset = self.settings.presets[index]
         if not preset.is_set:
             self._emit("error", f"Preset '{preset.name}' has no level stored yet")
             return
+        if self.selection == ("preset", index):
+            self.clear_selection()       # clicking the active one undoes it
+            return
+        self._set_selection(("preset", index))
         self.submit("recall_preset", lambda s: s.set_volume(preset.db))
-        self._emit("preset_recalled", index)
 
     def capture_preset(self, index: int) -> None:
         """Store the knob's current position into a slot."""
@@ -131,13 +153,14 @@ class Controller:
         self._emit("preset_captured", (index, knob))
 
     def mute(self) -> None:
+        self._set_selection(("mute",))
         self.submit("mute", lambda s: s.mute())
 
     def unmute(self) -> None:
-        self.submit("unmute", lambda s: s.unmute())
+        self.clear_selection()
 
     def toggle_mute(self) -> None:
-        self.submit("toggle_mute", lambda s: s.toggle_mute())
+        self.unmute() if self.selection == ("mute",) else self.mute()
 
     def wake(self) -> None:
         self.submit("wake", lambda s: s.wake())
@@ -145,8 +168,14 @@ class Controller:
     def shutdown_speakers(self) -> None:
         self.submit("shutdown", lambda s: s.shutdown())
 
-    def rediscover(self) -> None:
-        self.submit("discover", lambda s: s.discover())
+    def identify_speaker(self, serial: int,
+                         seconds: float = IDENTIFY_SECONDS) -> None:
+        """Flag one speaker's LED so the user can see which cabinet it is."""
+        self.submit("identify",
+                    lambda s: s.start_identify(int(serial), seconds))
+
+    def stop_identify(self) -> None:
+        self.submit("stop_identify", lambda s: s.stop_identify())
 
     def clear_state(self) -> None:
         """Repair: return every monitor to normal operation."""
@@ -155,6 +184,12 @@ class Controller:
     # -- worker ----------------------------------------------------------
 
     def _emit(self, name: str, payload: Any = None) -> None:
+        if name == "knob_moved" and self.selection is not None:
+            # The hand on the knob outranks any override. Drop the selection
+            # without writing a level -- the session has already applied the
+            # knob's position by the time this fires.
+            self.selection = None
+            self._emit("selection_changed", None)
         if name == "error" and self._suppress_error(str(payload)):
             return
         try:
@@ -192,6 +227,12 @@ class Controller:
             self._emit("disconnected", str(exc))
             return None
         session = Session(transport, on_event=self._emit)
+        details = hidinfo.enumerate_adapter(GLM_VID, GLM_PID)
+        session.adapter.manufacturer = details.get("manufacturer", "")
+        session.adapter.product = details.get("product", "")
+        session.adapter.hid_path = details.get("path", "")
+        session.adapter.usb_location = (
+            hidinfo.usb_location(session.adapter.hid_path) or "")
         session.max_volume_db = self.settings.max_volume_db
         session.default_volume_db = self.settings.default_volume_db
         try:
@@ -240,6 +281,8 @@ class Controller:
             try:
                 self._drain_commands(session)
                 session.heartbeat()
+                # Restores a flagged LED even if whoever asked has gone away.
+                session.service_identify()
 
                 now = time.monotonic()
                 if now >= next_adapter_poll:
@@ -249,14 +292,16 @@ class Controller:
                 # Pick up speakers switched on after launch. Nothing else
                 # would: the poll loop only visits known monitors, so a new
                 # one generates no timeout and never triggers recovery.
-                if now >= next_discovery:
+                # Suppressed while asleep -- RACE is a roll-call that wakes
+                # the speakers we just shut down.
+                if now >= next_discovery and not session.asleep:
                     next_discovery = now + cid.DISCOVERY_INTERVAL_S
                     session.discover()
 
                 # Monitors refresh ~1 Hz, so poll them round-robin rather than
                 # all at once: it spreads bus load and keeps latency even.
                 monitors = list(session.monitors.values())
-                if monitors and now >= next_monitor_poll:
+                if monitors and now >= next_monitor_poll and not session.asleep:
                     interval = cid.MONITOR_POLL_INTERVAL_S / len(monitors)
                     next_monitor_poll = now + interval
                     monitor_cursor %= len(monitors)
@@ -284,6 +329,12 @@ class Controller:
             self._stop.wait(IDLE_SLEEP_S)
 
         if session is not None:
+            # Never exit leaving a speaker flagged: that state also freezes
+            # its volume, and nothing would be left running to undo it.
+            try:
+                session.stop_identify()
+            except Exception:  # noqa: BLE001
+                logger.debug("could not clear identify on exit", exc_info=True)
             # Leave the system matching the physical control. Once we release
             # the bus the adapter resumes applying the pot, but only from the
             # next time it moves -- so if we exit with a preset active, the

@@ -12,6 +12,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+from . import APP_TITLE, __version__
 from .core.settings import Settings
 from .resources import app_icon
 from .ui.bridge import Bridge
@@ -28,8 +29,10 @@ def main(argv=None) -> int:
 
     # QApplication (not QGuiApplication) because QSystemTrayIcon is a widget.
     app = QApplication(argv)
-    app.setApplicationName("GenlcUI")
-    app.setOrganizationName("GenlcUI")
+    app.setApplicationName(APP_TITLE)
+    app.setApplicationDisplayName(APP_TITLE)
+    app.setApplicationVersion(__version__)
+    app.setOrganizationName(APP_TITLE)
     app.setDesktopFileName("genlcui")
     app.setWindowIcon(app_icon())
 

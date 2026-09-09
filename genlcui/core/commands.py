@@ -83,5 +83,11 @@ DISCOVERY_INTERVAL_S = 2.0
 # and lands at the documented bottom of the fader.
 STATE_NORMAL = 0x00     # verified: restores normal operation
 
+# Used by "identify this speaker": lights the LED steady red so you can tell
+# which cabinet you are naming. NOT cosmetic -- this is the same value that
+# froze the author's volume control, so it must always be time limited and
+# always restored to STATE_NORMAL. See Session.start_identify.
+STATE_IDENTIFY = 0x02
+
 # 0x02, 0x04, 0x06 are deliberately unnamed. 0x02 is known to break volume
 # control; the other two are untested. Nothing in the UI should reach them.

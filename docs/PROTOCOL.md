@@ -4,10 +4,10 @@ Findings from live reverse engineering against a real rig, extending what
 `genlc/` (vendored from [markbergsma/genlc](https://github.com/markbergsma/genlc))
 implements. Everything here was observed on:
 
-- GLM Adapter, fw `1.3.2.5053`, with calibration mic attached (serial 208354)
-- Genelec 7350A subwoofer (addr 2, serial 1128979)
-- 2x Genelec 8330A (addr 3/4, serials 1093534 / 1093526)
-- All three previously grouped and calibrated with GLM5 on Windows
+- GLM Adapter, fw `1.3.2.5053`, with calibration mic attached
+- Genelec 7350A subwoofer
+- 2x Genelec 8330A
+- All three previously grouped and calibrated with [GLM5](https://www.genelec.com/glm) on Windows
 
 ## Message framing
 
@@ -168,6 +168,36 @@ without the silence. **Untested**, and there is no need to test it.
 Observed behaviour on real hardware > Genelec's documentation > genlc's
 naming. Each of the three disagreed with the next in this one command, in
 that order of reliability.
+
+## Sleep is advisory, not authoritative
+
+`CID_WAKEUP` with the shutdown payloads does put monitors into standby, but
+they wake themselves again through ISS (Intelligent Signal Sensing). Genelec
+documents three things that prevent or end ISS sleep:
+
+* a signal on the analogue input,
+* **a bit clock on the digital input** -- audio need not be playing,
+* **commands received on the GLM network**.
+
+The third one is ours to control, and getting it wrong is why an early
+version's speakers woke a few seconds after every shutdown: the app kept
+broadcasting `STAY_ONLINE` (which does exactly what its name says) four times
+a second, plus a `RACE` roll-call every two seconds. Sleep must therefore
+suppress the heartbeat, discovery, monitor polling and knob mirroring -- see
+`Session.asleep`.
+
+The first two are not ours to control. On a digital connection with an open
+sink, the bit clock alone keeps the monitors awake indefinitely, so a
+commanded sleep will not hold until the source releases the device.
+
+There is also no way to observe the wake: any query that would reveal it is a
+GLM network command, which is itself a reason for the monitor to stay awake.
+The UI therefore reports sleep as commanded, with a note that the speakers may
+wake on their own.
+
+`CID_ISS` appears in genlc's constant list but is unassigned, so the ISS
+timeout cannot currently be configured from here. There is a hardware
+`ISS Disable` switch on each cabinet's back plate.
 
 ## Safety
 

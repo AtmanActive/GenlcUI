@@ -58,6 +58,12 @@ class Adapter:
     barcode: str = ""
     mic_serial: str = ""
 
+    # Where it is, for diagnostics
+    manufacturer: str = ""
+    product: str = ""
+    hid_path: str = ""
+    usb_location: str = ""
+
     # Live status
     knob_db: Optional[float] = None
     mic_raw: Optional[int] = None

@@ -7,11 +7,17 @@ is running rather than having it lurk invisibly.
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import QObject, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from ..resources import app_icon
+from .. import APP_HOMEPAGE, APP_TITLE, __version__
+
+from ..resources import app_icon, state_colour, state_icon
+
+logger = logging.getLogger(__name__)
 
 
 class Tray(QObject):
@@ -20,7 +26,7 @@ class Tray(QObject):
         self._bridge = bridge
         self._window = window
         self._icon = QSystemTrayIcon(app_icon(), self)
-        self._icon.setToolTip("Genelec")
+        self._icon.setToolTip(APP_TITLE)
         self._menu = QMenu()
         self._preset_actions = []
         self._build()
@@ -32,6 +38,9 @@ class Tray(QObject):
         bridge.mutedChanged.connect(self._sync)
         bridge.knobChanged.connect(self._sync)
         bridge.connectedChanged.connect(self._sync)
+        bridge.asleepChanged.connect(self._sync)
+        bridge.activePresetChanged.connect(self._sync)
+        self._colour = ""
         self._sync()
 
     def _build(self) -> None:
@@ -46,6 +55,9 @@ class Tray(QObject):
         self._mute_action = QAction("Mute", self)
         self._mute_action.triggered.connect(self._bridge.toggleMute)
         self._menu.addAction(self._mute_action)
+        # Mute stands alone: it belongs to the same exclusive group as the
+        # presets above it, not to the power actions below.
+        self._menu.addSeparator()
 
         wake = QAction("Wake speakers", self)
         wake.triggered.connect(self._bridge.wake)
@@ -56,6 +68,11 @@ class Tray(QObject):
         self._menu.addAction(sleep)
 
         self._menu.addSeparator()
+        about = QAction(f"{APP_TITLE} {__version__}…", self)
+        about.setToolTip(APP_HOMEPAGE)
+        about.triggered.connect(self._bridge.openHomepage)
+        self._menu.addAction(about)
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self._quit)
         self._menu.addAction(quit_action)
@@ -78,15 +95,37 @@ class Tray(QObject):
 
     @Slot()
     def _sync(self) -> None:
-        self._mute_action.setText("Unmute" if self._bridge.muted else "Mute")
-        if not self._bridge.connected:
-            self._icon.setToolTip("Genelec — adapter not available")
-        elif self._bridge.muted:
-            self._icon.setToolTip("Genelec — muted")
-        elif self._bridge.knobKnown:
-            self._icon.setToolTip(f"Genelec — {self._bridge.knobDb:.1f} dB")
-        else:
-            self._icon.setToolTip("Genelec")
+        bridge = self._bridge
+        self._mute_action.setText("Unmute" if bridge.muted else "Mute")
+        self._apply_icon(bridge)
+        self._icon.setToolTip(self._tooltip(bridge))
+
+    def _apply_icon(self, bridge) -> None:
+        colour = state_colour(asleep=bridge.asleep, muted=bridge.muted,
+                              preset=bridge.activePreset)
+        if (colour or "") == self._colour:
+            return
+        self._colour = colour or ""
+        icon = state_icon(colour)
+        logger.info("tray icon -> %s (themed=%r, null=%s)",
+                    colour or "default", icon.name(), icon.isNull())
+        self._icon.setIcon(icon)
+
+    @staticmethod
+    def _tooltip(bridge) -> str:
+        if not bridge.connected:
+            return f"{APP_TITLE} — adapter not available"
+        if bridge.asleep:
+            return f"{APP_TITLE} — speakers asleep"
+        if bridge.muted:
+            return f"{APP_TITLE} — muted"
+        presets = bridge.presets
+        if 0 <= bridge.activePreset < len(presets):
+            preset = presets[bridge.activePreset]
+            return f"{APP_TITLE} — {preset['name']}  {preset['db']:.1f} dB"
+        if bridge.knobKnown:
+            return f"{APP_TITLE} — {bridge.knobDb:.1f} dB"
+        return APP_TITLE
 
     def _on_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:

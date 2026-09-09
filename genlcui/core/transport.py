@@ -13,6 +13,7 @@ import threading
 from typing import Optional, Protocol
 
 from . import protocol
+from .crc import gsm16
 from .protocol import DeviceTimeout, ProtocolError, Request, Response
 
 logger = logging.getLogger(__name__)
@@ -56,25 +57,71 @@ class Transport:
 
     # -- raw IO ----------------------------------------------------------
 
+    @staticmethod
+    def _extract(buffer: bytearray):
+        """Find one complete message in `buffer`.
+
+        Returns the unescaped message, or None if more data is needed.
+
+        Terminator hunting is not as simple as "cut at the first 0x7E":
+
+        * A timeout response carries 0x7E as its *code* byte, at index 1, so
+          the earliest a terminator can legitimately appear is index 4 (the
+          shortest valid message is address, code, two CRC bytes, terminator).
+        * More than one message can share a packet, so the whole buffer is
+          not necessarily one message.
+
+        So candidates are checked by CRC and the first that validates wins.
+        A message whose CRC fails is still returned (as the first candidate)
+        so the caller reports a checksum error and resynchronises, rather
+        than this guessing where a later message might begin.
+        """
+        first = None
+        start = 4
+        while True:
+            end = buffer.find(protocol.GNET_TERM, start)
+            if end < 0:
+                # No further candidates. Surface the earliest one so the
+                # caller reports a checksum error rather than blocking.
+                return first
+            candidate = protocol.unescape(bytes(buffer[:end + 1]))
+            if first is None:
+                first = candidate
+            if len(candidate) >= 5:
+                want = int.from_bytes(candidate[-3:-1], "big")
+                if gsm16(candidate[:-3]) == want:
+                    trailing = bytes(buffer[end + 1:]).rstrip(b"\0")
+                    if trailing:
+                        # A second message shared the packet. It cannot be
+                        # attributed to a request (responses carry no source
+                        # address), so it is dropped rather than guessed at.
+                        logger.debug("discarding %d byte(s) after terminator: %r",
+                                     len(trailing), trailing)
+                    return candidate
+            start = end + 1
+
     def _read_message(self, timeout_ms: int) -> bytes:
-        """Reassemble one message from up to MAX_SEGMENTS HID packets."""
-        segments = []
+        """Reassemble one message from the HID endpoint."""
+        buffer = bytearray()
+        segments = 0
         while True:
             packet = self._device.read(protocol.MAX_PACKET_LEN, timeout_ms)
             if not packet:
                 raise TransportError(
                     f"no response from the adapter within {timeout_ms}ms"
                 )
-            segments.append(bytes(packet))
-            # Byte 0 is a per-packet length marker; the payload follows it.
-            if bytes(packet)[1:].rstrip(b"\0").endswith(bytes((protocol.GNET_TERM,))):
-                break
-            if len(segments) >= MAX_SEGMENTS:
+            segments += 1
+            # Byte 0 of each packet is a length marker; the payload follows.
+            buffer += bytes(packet)[1:]
+
+            message = self._extract(buffer)
+            if message is not None:
+                return message
+
+            if segments >= MAX_SEGMENTS:
                 raise TransportError(
                     f"message did not terminate within {MAX_SEGMENTS} packets"
                 )
-        joined = bytearray().join(s[1:] for s in segments).rstrip(b"\0")
-        return protocol.unescape(bytes(joined))
 
     def drain(self, timeout_ms: int = 5) -> int:
         """Discard anything already queued. Returns how many packets went.
@@ -113,6 +160,12 @@ class Transport:
         """
         timeout = self._timeout_ms if timeout_ms is None else timeout_ms
         with self._lock:
+            # Nothing should be queued: this is synchronous, so every earlier
+            # response was consumed. Anything present is stale -- typically a
+            # reply to a broadcast we sent fire-and-forget (volume, keepalive,
+            # wakeup). Left in place it would be handed back as *this*
+            # request's answer and shift every pair from here on.
+            self.drain(timeout_ms=0)
             self._device.write(request.usb_frame())
             raw = self._read_message(timeout)
             try:

@@ -62,6 +62,11 @@ class Settings:
     start_minimised: bool = True
     wake_on_start: bool = False
 
+    # Appearance
+    theme_mode: str = "system"        # system | light | dark
+    theme_name: str = "Slate"
+    text_size: str = "default"
+
     # -- persistence -----------------------------------------------------
 
     @classmethod
@@ -118,3 +123,13 @@ class Settings:
 
     def exceeds_ceiling(self, db: float) -> bool:
         return db > self.max_volume_db
+
+    def capture_ceiling(self, db: float) -> float:
+        """Set the safety ceiling from the knob's current position.
+
+        Same rule as presets, and for the same reason: a limit typed as a
+        number is a limit nobody has heard. Requiring the knob means the
+        ceiling is always a level the user has just listened to and judged.
+        """
+        self.max_volume_db = float(db)
+        return self.max_volume_db
