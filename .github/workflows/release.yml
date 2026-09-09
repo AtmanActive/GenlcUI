@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -42,9 +42,10 @@ jobs:
             xz-utils desktop-file-utils
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
+          cache-dependency-glob: pyproject.toml
 
       - name: Provide the interpreter the bundle is built from
         run: uv python install 3.12
@@ -103,7 +104,7 @@ jobs:
           sha256sum ./* > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: genlcui-${{ steps.meta.outputs.version }}
           path: dist/*
