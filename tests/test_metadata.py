@@ -36,3 +36,32 @@ def test_desktop_entry_matches_the_application_name():
 def test_version_is_a_sane_triple():
     parts = genlcui.__version__.split(".")
     assert len(parts) == 3 and all(p.isdigit() for p in parts)
+
+
+def test_desktop_entry_has_one_main_category():
+    """Two main categories can make the app appear twice in the menu."""
+    entry = (ROOT / "packaging/desktop/genlcui.desktop").read_text()
+    line = next(l for l in entry.splitlines() if l.startswith("Categories="))
+    categories = set(line.split("=", 1)[1].strip(";").split(";"))
+    main = {"AudioVideo", "Audio", "Development", "Education", "Game",
+            "Graphics", "Network", "Office", "Science", "Settings",
+            "System", "Utility"}
+    # Audio is a subcategory of AudioVideo, so that pairing is fine; what
+    # matters is not straddling two unrelated top-level sections.
+    assert "Settings" not in categories or "AudioVideo" not in categories
+    assert categories & main, "no main category at all"
+
+
+def test_desktop_exec_is_a_bare_command():
+    """Exec=genlcui only works if the launcher is on PATH -- the .deb puts it
+    in /usr/bin, and install-icons.sh links it for source checkouts."""
+    entry = (ROOT / "packaging/desktop/genlcui.desktop").read_text()
+    assert "Exec=genlcui\n" in entry
+
+
+def test_installer_links_the_launcher_for_source_checkouts():
+    """Regression: the start menu entry failed with "program not found"
+    because nothing put the console script on PATH."""
+    script = (ROOT / "packaging/install-icons.sh").read_text()
+    assert ".venv/bin/genlcui" in script
+    assert "$HOME/.local/bin" in script

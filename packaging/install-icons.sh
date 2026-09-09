@@ -33,3 +33,26 @@ command -v update-desktop-database >/dev/null && \
 
 echo "Installed $count icon files into $theme"
 echo "Installed desktop entry into $apps"
+
+# The desktop entry uses Exec=genlcui, which the .deb satisfies with
+# /usr/bin/genlcui. From a source checkout nothing puts the console script on
+# PATH, so the start menu entry would fail with "program not found" -- which
+# is exactly what happened. Link it here.
+bin="$HOME/.local/bin"
+if command -v genlcui >/dev/null 2>&1; then
+    echo "Launcher already on PATH: $(command -v genlcui)"
+elif [ -x "$here/.venv/bin/genlcui" ]; then
+    mkdir -p "$bin"
+    ln -sf "$here/.venv/bin/genlcui" "$bin/genlcui"
+    echo "Linked $bin/genlcui -> .venv/bin/genlcui"
+    case ":$PATH:" in
+        *":$bin:"*) ;;
+        *) echo "NOTE: $bin is not on your PATH. The start menu will still"
+           echo "      work, but 'genlcui' will not run from a shell until"
+           echo "      you add it." ;;
+    esac
+else
+    echo "WARNING: no 'genlcui' launcher found on PATH and no virtualenv at"
+    echo "         $here/.venv -- the start menu entry will not work."
+    echo "         Run 'uv pip install -e .' first, then re-run this script."
+fi
