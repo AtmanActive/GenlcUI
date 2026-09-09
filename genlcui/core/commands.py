@@ -45,6 +45,13 @@ HEARTBEAT_INTERVAL_S = 0.25
 MONITOR_POLL_INTERVAL_S = 1.0
 ADAPTER_POLL_INTERVAL_S = 0.05
 
+# Background rescan, so a speaker switched on after launch appears by itself.
+# The poll loop only visits monitors it already knows about, so without this
+# nothing would ever notice a new one. Cheap: a RACE that finds nothing is a
+# single timed-out request (~30ms), and a full discovery of three monitors was
+# measured at 0.068s.
+DISCOVERY_INTERVAL_S = 2.0
+
 # CID_BYPASS_QUERY carries a monitor STATE, not an LED colour.
 #
 # genlc models this byte as {bit 0: mute, bits 1-2: LED colour}, so calling

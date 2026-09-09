@@ -187,6 +187,13 @@ class Bridge(QObject):
     def maxVolumeDb(self) -> float:
         return self._settings.max_volume_db
 
+    @Property(bool, constant=True)
+    def trayAvailable(self) -> bool:
+        """Whether hiding the window leaves anything to get back to."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        return QSystemTrayIcon.isSystemTrayAvailable()
+
     # -- slots -----------------------------------------------------------
 
     @Slot()
@@ -196,6 +203,17 @@ class Bridge(QObject):
     @Slot()
     def stop(self) -> None:
         self.controller.stop()
+
+    @Slot()
+    def quitApplication(self) -> None:
+        """Exit. The bus is released on the way out, which hands volume
+        control back to the adapter -- the knob keeps working without us."""
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()       # aboutToQuit stops the controller and restores
+                             # the knob position before the thread joins
 
     @Slot(int)
     def recallPreset(self, index: int) -> None:

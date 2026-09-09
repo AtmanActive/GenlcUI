@@ -11,7 +11,8 @@ from genlcui.core import commands as cid
 from genlcui.core.crc import gsm16
 from genlcui.core.devices import Monitor
 from genlcui.core.protocol import (
-    BROADCAST_ADDR, DeviceTimeout, GNET_ACK, GNET_TIMEOUT, Request,
+    BROADCAST_ADDR, DeviceTimeout, GNET_ACK, GNET_TIMEOUT, ProtocolError,
+    Request,
 )
 from genlcui.core.session import Session, db_to_sint24
 from genlcui.core.transport import Transport
@@ -90,10 +91,10 @@ def test_set_volume_broadcasts():
 
 # -- wake ordering -------------------------------------------------------
 
-def test_wake_sets_volume_before_waking():
-    """Genelec monitors default to maximum level; a bare wakeup is unsafe."""
+def test_wake_ducks_before_waking():
+    """Monitors boot at maximum level, so silence must precede the wakeup."""
     hid, session, _ = make([None])          # RACE finds nothing
-    session.wake(-50.0)
+    session.wake(-50.0, settle_s=0.05)
     kinds = hid.sent_requests()
     first_volume = next(i for i, (_, c) in enumerate(kinds)
                         if c == cid.CID_VOLUME_GLM)
@@ -102,14 +103,32 @@ def test_wake_sets_volume_before_waking():
     assert first_volume < first_wake
 
 
+def test_wake_holds_silence_across_the_whole_boot_window():
+    """One duck before the wakeup protects nothing: a booting monitor cannot
+    hear it. The safe level must be re-sent while they come up."""
+    hid, session, _ = make([None] * 40)
+    session.wake(-50.0, settle_s=0.6)
+    kinds = hid.sent_requests()
+    last_wake = max(i for i, (_, c) in enumerate(kinds) if c == cid.CID_WAKEUP)
+    after = [c for _, c in kinds[last_wake:] if c == cid.CID_VOLUME_GLM]
+    assert len(after) >= 3
+
+
 def test_wake_reasserts_volume_afterwards():
-    hid, session, _ = make([None])
-    session.wake(-50.0)
+    hid, session, _ = make([None] * 40)
+    session.wake(-50.0, settle_s=0.05)
     volumes = [i for i, (_, c) in enumerate(hid.sent_requests())
                if c == cid.CID_VOLUME_GLM]
     wakes = [i for i, (_, c) in enumerate(hid.sent_requests())
              if c == cid.CID_WAKEUP]
     assert volumes[-1] > wakes[-1]
+
+
+def test_wake_drains_after_broadcasts():
+    """Unread replies to a broadcast would be handed to the next request."""
+    hid, session, _ = make([None] * 40)
+    session.wake(-50.0, settle_s=0.05)
+    assert session.volume_db is not None
 
 
 # -- polling -------------------------------------------------------------
@@ -299,23 +318,27 @@ def test_device_timeout_does_not_drain_the_queue():
 
 def test_wake_defaults_to_the_pot_position():
     """The knob is master, so waking should land where it points."""
-    _, session, _ = make([None])
+    _, session, _ = make([None] * 40)
     session.adapter.knob_db = -55.0
-    session.wake()
+    session.wake(settle_s=0.05)
     assert session.volume_db == -55.0
 
 
 def test_wake_falls_back_to_the_default_when_the_pot_is_unknown():
-    _, session, _ = make([None])
-    session.wake()
+    _, session, _ = make([None] * 40)
+    session.wake(settle_s=0.05)
     assert session.volume_db == session.default_volume_db
 
 
-def test_wake_clamps_the_pot_position_to_the_ceiling():
-    _, session, _ = make([None])
-    session.adapter.knob_db = -5.0        # knob turned well up
-    session.wake()
-    assert session.volume_db == -30.0
+def test_wake_settles_to_the_pot_position_not_the_ceiling():
+    """The knob mirror is unclamped, so the steady state with the knob here is
+    this level. Clamping only at wake would create a jump the moment the user
+    next touched the pot -- a hazard, not a protection. The protection is
+    holding silence until the monitors are answering."""
+    _, session, _ = make([None] * 40)
+    session.adapter.knob_db = -5.0
+    session.wake(settle_s=0.05)
+    assert session.volume_db == -5.0
 
 
 # -- knob mirroring ------------------------------------------------------
@@ -380,3 +403,103 @@ def test_moving_the_knob_cancels_a_mute():
     session.poll_adapter()
     assert not session.muted
     assert session.volume_db == pytest.approx(-55.0)
+
+
+# -- desync and storm protection -----------------------------------------
+#
+# Regression coverage for the incident where clicking Wake desynchronised the
+# bus, triggered several rediscoveries a second, and left the speakers at
+# their factory-maximum startup level emitting full-scale noise.
+
+def test_shutdown_ducks_before_sleeping():
+    """A monitor that ignores the sleep must not be left sitting loud."""
+    hid, session, _ = make()
+    session.set_volume(-40.0)
+    before = len(hid.written)
+    session.shutdown()
+    kinds = [c for _, c in hid.sent_requests()[before:]]
+    assert kinds.index(cid.CID_VOLUME_GLM) < kinds.index(cid.CID_WAKEUP)
+
+
+def test_rediscovery_is_rate_limited():
+    """Without a cooldown, a booting or absent monitor re-discovers on every
+    poll -- three times a second, indefinitely, drowning the bus."""
+    replies = [frame(b"", code=GNET_TIMEOUT)] * 40
+    hid, session, _ = make(replies)
+    monitor = Monitor(serial=1, address=2)
+    session.monitors[1] = monitor
+
+    with pytest.raises(DeviceTimeout):
+        session.poll_monitor(monitor)          # first one may re-discover
+    races_after_first = sum(1 for _, c in hid.sent_requests()
+                            if c == cid.CID_RACE)
+    for _ in range(5):
+        with pytest.raises(DeviceTimeout):
+            session.poll_monitor(monitor)
+    races_total = sum(1 for _, c in hid.sent_requests() if c == cid.CID_RACE)
+    assert races_total == races_after_first, "re-discovered inside the cooldown"
+
+
+def test_decode_failure_resyncs_the_transport():
+    """A wrong-device reply arrives after the transport has already returned,
+    so its own resync never runs and the desync would persist."""
+    hid, session, _ = make([frame(b"\x84\x01")])   # 16-bit tag, 1 byte of value
+    monitor = Monitor(serial=1, address=2)
+    session.monitors[1] = monitor
+    before = len(hid.replies)
+    with pytest.raises(ProtocolError):
+        session.poll_monitor(monitor)
+    assert len(hid.replies) <= before      # drain ran
+
+
+def test_knob_is_not_mirrored_during_a_disruptive_operation():
+    """Mirroring mid-wake would fight the safety duck."""
+    _, session, _ = make([_knob_frame(-40.0)])
+    session._busy = True
+    session.poll_adapter()
+    assert session.volume_db is None       # duck owns the level
+
+
+def test_guarded_restores_the_intended_level():
+    _, session, _ = make()
+    session.set_volume(-45.0)
+    with session.guarded():
+        pass
+    assert session.volume_db == pytest.approx(-45.0)
+
+
+def test_guarded_ducks_while_inside():
+    hid, session, _ = make()
+    session.set_volume(-45.0)
+    marker = len(hid.written)
+    with session.guarded():
+        sent = [w[2:] for w in hid.written[marker:]]
+    assert sent, "nothing was written on entry"
+    payload = sent[0]
+    level = int.from_bytes(payload[2:5], "big", signed=True)
+    assert level < db_to_sint24(-100.0) * 10   # deeply attenuated
+
+
+def test_newly_discovered_monitor_is_brought_to_the_current_level():
+    """A monitor that boots late comes up at its factory maximum. It must not
+    stay there until the user happens to touch the knob."""
+    replies = [frame(b"\x00\x00\x09"), frame(b"\x02"), None]
+    hid, session, _ = make(replies)
+    session.set_volume(-55.0)
+    marker = len(hid.written)
+    session.discover()
+    levels = [w[2:] for w in hid.written[marker:]
+              if len(w) > 3 and w[3] == cid.CID_VOLUME_GLM]
+    assert levels, "no level asserted for the new monitor"
+
+
+def test_discovery_during_a_guarded_operation_does_not_break_the_duck():
+    replies = [frame(b"\x00\x00\x09"), frame(b"\x02"), None]
+    hid, session, _ = make(replies)
+    session.set_volume(-55.0)
+    session._busy = True
+    marker = len(hid.written)
+    session.discover()
+    levels = [w for w in hid.written[marker:]
+              if len(w) > 3 and w[3] == cid.CID_VOLUME_GLM]
+    assert not levels, "asserted a level while silence was being held"

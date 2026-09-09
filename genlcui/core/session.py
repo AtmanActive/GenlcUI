@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional
 
 from . import commands as cid
@@ -31,6 +32,22 @@ MAX_ADDRESS = 128
 # is a comfortable default. The ceiling applies to every write.
 SAFETY_MAX_DB = -30.0
 DEFAULT_VOLUME_DB = -50.0
+
+# Every operation that disturbs the bus ducks to this first and restores
+# afterwards. Genelec SAM monitors boot at MAXIMUM level in standalone mode,
+# so any window where a monitor is coming up and we are not in control of its
+# level is a window where the room gets full-scale noise. Ducking costs
+# nothing and removes that window entirely.
+SAFE_DUCK_DB = -120.0
+
+# Waking is slow: monitors boot over several seconds and answer nothing until
+# they do. Keep re-asserting the safe level throughout, then settle.
+WAKE_SETTLE_S = 8.0
+WAKE_POLL_S = 0.25
+
+# A lease expiry re-discovers, but a booting or absent monitor would otherwise
+# trigger that on every poll -- three times a second, indefinitely.
+REDISCOVER_COOLDOWN_S = 2.0
 
 
 def db_to_sint24(db: float) -> int:
@@ -69,6 +86,8 @@ class Session:
         # So mirroring knob -> volume is our job, not the firmware's, and it
         # is what GLM5 must be doing too.
         self.follow_knob = True
+        self._last_rediscover = 0.0
+        self._busy = False        # a disruptive operation owns the volume
 
     # -- events ----------------------------------------------------------
 
@@ -155,7 +174,15 @@ class Session:
         for monitor in found:
             if not monitor.model:
                 self._identify(monitor)
+
         if found:
+            # Anything that just joined the bus booted at its stored startup
+            # level, which Genelec ships as MAXIMUM. Bring it to the level the
+            # rest of the system is at before anyone hears it. Skipped while a
+            # guarded operation owns the volume -- that path is already
+            # holding silence deliberately.
+            if not self._busy and self.volume_db is not None:
+                self._write_volume(self.volume_db)
             self._emit("devices_changed", list(self.monitors.values()))
         return found
 
@@ -197,12 +224,19 @@ class Session:
     def _with_recovery(self, fn: Callable[[], object]) -> object:
         """Run fn, and on a lease expiry re-discover once and retry.
 
-        Measured recovery cost is ~30ms, so this is invisible in the UI and
-        does not warrant surfacing an error to the user.
+        Rate limited. A monitor that is booting, powered off or unplugged
+        times out on every poll, and re-discovering each time produced a storm
+        of several rediscoveries a second that drowned the bus and prevented
+        any real work -- including getting freshly woken monitors down from
+        their factory-maximum startup level.
         """
         try:
             return fn()
         except DeviceTimeout:
+            now = time.monotonic()
+            if now - self._last_rediscover < REDISCOVER_COOLDOWN_S:
+                raise
+            self._last_rediscover = now
             logger.info("address lease expired; re-discovering")
             for monitor in self.monitors.values():
                 monitor.online = False
@@ -214,14 +248,18 @@ class Session:
     def poll_adapter(self) -> Adapter:
         """Read the knob position and microphone level."""
         resp = self.transport.request(Request(ADAPTER_ADDR, cid.CID_POLL))
-        status = decode_adapter_status(resp.payload)
+        try:
+            status = decode_adapter_status(resp.payload)
+        except ProtocolError:
+            self.transport.drain(timeout_ms=20)
+            raise
         if status.volume_db is not None:
             previous = self.adapter.knob_db
             self.adapter.knob_db = status.volume_db
             if previous != status.volume_db:
                 # The pot moved (or this is the first reading). Software
                 # writes cannot move it, so this is the user's hand.
-                if self.follow_knob:
+                if self.follow_knob and not self._busy:
                     # Deliberately unclamped: the ceiling guards programmatic
                     # writes, which have no physical act behind them. Clamping
                     # the knob would make the hardware feel broken above the
@@ -243,7 +281,13 @@ class Session:
         if resp.is_empty_ack:
             # Rate limit, not a dropout: keep the previous reading.
             return None
-        status = decode_monitor_status(resp.payload)
+        try:
+            status = decode_monitor_status(resp.payload)
+        except ProtocolError:
+            # We were handed someone else's reply. The transport had already
+            # returned by this point, so its own resync never ran.
+            self.transport.drain(timeout_ms=20)
+            raise
         monitor.temperature_c = status.temperature_c
         monitor.tags = status.tags
         monitor.online = True
@@ -251,6 +295,46 @@ class Session:
         return monitor
 
     # -- control ---------------------------------------------------------
+
+    def _write_volume(self, db: float) -> None:
+        """Send a level without touching the volume model.
+
+        Used for safety ducking, where the user's intended level must survive
+        the operation unchanged.
+        """
+        db = max(VOLUME_MIN_DB, min(VOLUME_MAX_DB, float(db)))
+        self.transport.send(Request(
+            BROADCAST_ADDR, cid.CID_VOLUME_GLM,
+            db_to_sint24(db).to_bytes(3, "big", signed=True)))
+
+    @contextmanager
+    def guarded(self, settle: float = 0.0):
+        """Duck to a safe level for the duration of a disruptive operation.
+
+        Restores the user's intended level afterwards, re-asserting it a few
+        times because monitors that were booting during the operation may not
+        have been listening the first time.
+        """
+        intended = self.volume_db
+        self._busy = True
+        self._write_volume(SAFE_DUCK_DB)
+        try:
+            yield
+        finally:
+            self._busy = False
+            target = intended
+            if target is None:
+                target = (self.adapter.knob_db
+                          if self.adapter.knob_db is not None
+                          else self.default_volume_db)
+            if settle:
+                deadline = time.monotonic() + settle
+                while time.monotonic() < deadline:
+                    self._write_volume(SAFE_DUCK_DB)
+                    time.sleep(WAKE_POLL_S)
+            for _ in range(3):
+                self.set_volume(target, clamp=False)
+                time.sleep(0.05)
 
     def set_volume(self, db: float, *, clamp: bool = True,
                    _keep_mute: bool = False) -> float:
@@ -273,37 +357,85 @@ class Session:
         self._emit("volume_set", db)
         return db
 
-    def wake(self, volume_db: Optional[float] = None) -> None:
-        """Wake every monitor at a known volume.
+    def wake(self, volume_db: Optional[float] = None,
+             settle_s: Optional[float] = None) -> None:
+        """Wake every monitor, holding them silent until they are under control.
 
-        Volume first, deliberately. Genelec documents that SAM monitors start
-        at *maximum* level by default in standalone mode, so a bare wakeup
-        hands control to whatever is stored in speaker flash.
+        Genelec documents that SAM monitors start at *maximum* level in
+        standalone mode. A monitor booting is therefore a full-scale noise
+        source until something tells it otherwise, and it cannot hear us until
+        it has finished booting -- so setting the level once before the wakeup
+        (which is what an earlier version did) protects nothing.
 
-        With no level given, the pot's current position is used: it is where
-        the physical control says the system should be, so it is both safe
-        and unsurprising.
+        Instead we hold the safe level down across the whole boot window, then
+        settle to the intended level once monitors are answering again.
         """
-        if volume_db is None:
-            volume_db = (self.adapter.knob_db
-                         if self.adapter.knob_db is not None
-                         else self.default_volume_db)
-        self.set_volume(volume_db)
-        time.sleep(0.05)
-        for data in (bytes([3, 0x7F]), bytes([3, 1])):
-            request = Request(BROADCAST_ADDR, cid.CID_WAKEUP, data)
-            self.transport.send(request)
-            self.transport.send(request)
-        time.sleep(0.5)
-        self.discover()
-        self.set_volume(volume_db)     # re-assert once they are listening
-        self._emit("woken", volume_db)
+        target = volume_db
+        if target is None:
+            target = (self.adapter.knob_db
+                      if self.adapter.knob_db is not None
+                      else self.default_volume_db)
+
+        intended = self.volume_db
+        self._busy = True
+        try:
+            self._write_volume(SAFE_DUCK_DB)
+            for data in (bytes([3, 0x7F]), bytes([3, 1])):
+                request = Request(BROADCAST_ADDR, cid.CID_WAKEUP, data)
+                self.transport.send(request)
+                self.transport.send(request)
+
+            # Broadcasts may be answered. Anything left unread here would be
+            # handed to the next request as if it were its reply, shifting
+            # every request/response pair from now on.
+            self.transport.drain(timeout_ms=50)
+
+            window = WAKE_SETTLE_S if settle_s is None else settle_s
+            deadline = time.monotonic() + window
+            expected = len(self.monitors)
+            while time.monotonic() < deadline:
+                self._write_volume(SAFE_DUCK_DB)   # hammer it while they boot
+                self.heartbeat(force=True)
+                try:
+                    for monitor in self.monitors.values():
+                        monitor.online = False
+                    found = self.discover()
+                except (ProtocolError, TransportError):
+                    self.transport.drain(timeout_ms=20)
+                    found = []
+                online = sum(1 for m in self.monitors.values() if m.online)
+                # Everything we knew about is back, or something answered when
+                # we knew of nothing at all.
+                if (expected and online >= expected) or (not expected and found):
+                    break
+                time.sleep(WAKE_POLL_S)
+
+            self._write_volume(SAFE_DUCK_DB)
+        finally:
+            self._busy = False
+            settle = intended if intended is not None else target
+            for _ in range(3):
+                self.set_volume(settle, clamp=False)
+                time.sleep(0.05)
+        self._emit("woken", self.volume_db)
 
     def shutdown(self) -> None:
-        for data in (bytes([3, 2]), bytes([3, 0])):
-            request = Request(BROADCAST_ADDR, cid.CID_WAKEUP, data)
-            self.transport.send(request)
-            self.transport.send(request)
+        """Put every monitor to sleep, quietly.
+
+        Ducked first: if a monitor ignores the shutdown or wakes again later,
+        it must not be sitting at a loud level when it does.
+        """
+        self._busy = True
+        try:
+            self._write_volume(SAFE_DUCK_DB)
+            time.sleep(0.05)
+            for data in (bytes([3, 2]), bytes([3, 0])):
+                request = Request(BROADCAST_ADDR, cid.CID_WAKEUP, data)
+                self.transport.send(request)
+                self.transport.send(request)
+            self.transport.drain(timeout_ms=50)
+        finally:
+            self._busy = False
         for monitor in self.monitors.values():
             monitor.online = False
         self._emit("shutdown", None)

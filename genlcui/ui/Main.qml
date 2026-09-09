@@ -24,6 +24,29 @@ ApplicationWindow {
 
     function fmtDb(v) { return (v > -130 ? v.toFixed(1) : "-∞") + " dB" }
 
+    component Action: Button {
+        // fillWidth alone distributes only the *surplus* evenly, starting
+        // from each button's implicitWidth -- so "Close" came out wider than
+        // "Quit" purely because the word is longer. A shared preferredWidth
+        // makes every Action in a row exactly equal regardless of its label.
+        Layout.fillWidth: true
+        Layout.preferredWidth: 1
+        implicitHeight: 38
+        property color tint: root.text
+        background: Rectangle {
+            radius: 7
+            color: parent.pressed ? root.line : root.surface
+            border.color: root.line
+        }
+        contentItem: Label {
+            text: parent.text
+            color: parent.enabled ? parent.tint : root.dim
+            font.pixelSize: 13
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+
     header: ToolBar {
         height: 44
         background: Rectangle { color: root.surface
@@ -39,10 +62,10 @@ ApplicationWindow {
                 text: bridge.status; color: root.dim; font.pixelSize: 12
                 Layout.fillWidth: true
             }
-            ToolButton {
-                text: "Rescan"; onClicked: bridge.rediscover()
-                contentItem: Label { text: parent.text; color: root.dim
-                                     font.pixelSize: 12 }
+            Label {
+                text: bridge.speakers.length > 0
+                      ? bridge.speakers.length + " speakers" : ""
+                color: root.dim; font.pixelSize: 12
             }
         }
     }
@@ -85,6 +108,36 @@ ApplicationWindow {
                     text: "mic " + bridge.micDbSpl.toFixed(1) + " dB SPL"
                     color: root.dim; font.pixelSize: 12
                 }
+            }
+        }
+
+        // ---- mute -----------------------------------------------------
+        // Deliberately the largest target in the window and closest to the
+        // level readout: it is the control you reach for in a hurry.
+        Button {
+            id: muteButton
+            Layout.fillWidth: true
+            implicitHeight: 76
+            onClicked: bridge.toggleMute()
+
+            background: Rectangle {
+                radius: 10
+                color: bridge.muted
+                       ? (muteButton.pressed ? Qt.darker(root.warn, 3.0)
+                                             : Qt.darker(root.warn, 3.6))
+                       : (muteButton.pressed ? root.line : root.surface)
+                border.color: bridge.muted ? root.warn : root.line
+                border.width: bridge.muted ? 2 : 1
+                Behavior on color { ColorAnimation { duration: 120 } }
+            }
+            contentItem: Label {
+                text: bridge.muted ? "UNMUTE" : "MUTE"
+                color: bridge.muted ? root.warn : root.text
+                font.pixelSize: 20
+                font.weight: Font.Medium
+                font.letterSpacing: 1.5
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
             }
         }
 
@@ -215,29 +268,26 @@ ApplicationWindow {
             Layout.fillWidth: true
             spacing: 8
 
-            component Action: Button {
-                Layout.fillWidth: true
-                implicitHeight: 38
-                property color tint: root.text
-                background: Rectangle {
-                    radius: 7
-                    color: parent.pressed ? root.line : root.surface
-                    border.color: root.line
-                }
-                contentItem: Label {
-                    text: parent.text; color: parent.enabled ? parent.tint
-                                                             : root.dim
-                    font.pixelSize: 13
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-
-            Action { text: bridge.muted ? "Unmute" : "Mute"
-                     tint: bridge.muted ? root.warn : root.text
-                     onClicked: bridge.toggleMute() }
             Action { text: "Wake"; onClicked: bridge.wake() }
             Action { text: "Sleep"; onClicked: bridge.sleep() }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+
+            // Close hides to the tray, where the app keeps running -- which
+            // it must, since the knob only works while we are mirroring it.
+            Action {
+                text: "Close"
+                enabled: bridge.trayAvailable
+                onClicked: root.hide()
+            }
+            Action {
+                text: "Quit"
+                tint: root.dim
+                onClicked: quitDialog.open()
+            }
         }
     }
 
@@ -272,6 +322,26 @@ ApplicationWindow {
             }
         }
         function onErrorRaised(message) { toast.show(message) }
+    }
+
+    // Quitting releases the bus. The adapter resumes applying the knob by
+    // itself, so nothing breaks -- but the presets, mute and the readouts all
+    // stop, and that is worth one click of confirmation.
+    Dialog {
+        id: quitDialog
+        anchors.centerIn: parent
+        modal: true
+        width: 360
+        title: "Quit Genelec?"
+        contentItem: Label {
+            text: "Volume control returns to the hardware knob.\n\n"
+                + "Presets, mute and the status display will stop working "
+                + "until you start the application again."
+            color: root.text
+            wrapMode: Text.WordWrap
+        }
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: bridge.quitApplication()
     }
 
     Rectangle {

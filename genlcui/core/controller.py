@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -34,6 +35,10 @@ GLM_PID = 0x0E39
 
 RECONNECT_DELAY_S = 2.0
 IDLE_SLEEP_S = 0.02
+
+# A desynchronised bus produces a decode error on every poll. Surfacing each
+# one floods the log and the UI with the same message many times a second.
+ERROR_REPEAT_S = 5.0
 
 
 @dataclass
@@ -57,6 +62,7 @@ class Controller:
         self._thread: Optional[threading.Thread] = None
         self._session: Optional[Session] = None
         self.connected = False
+        self._recent_errors: dict = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -149,10 +155,35 @@ class Controller:
     # -- worker ----------------------------------------------------------
 
     def _emit(self, name: str, payload: Any = None) -> None:
+        if name == "error" and self._suppress_error(str(payload)):
+            return
         try:
             self._on_event(name, payload)
         except Exception:  # noqa: BLE001
             logger.exception("event listener raised for %r", name)
+
+    @staticmethod
+    def _error_key(message: str) -> str:
+        """Reduce an error to its shape, ignoring the bytes that vary.
+
+        A desynchronised bus raises the same three or four failures over and
+        over with different values each time ("checksum 0xa != computed 0xb",
+        "truncated tag 0xe6 at offset 18 in b'...'"). Keying on the raw text
+        would treat every one as new.
+        """
+        head = message.split(" in b", 1)[0].split(" for payload", 1)[0]
+        return re.sub(r"0x[0-9a-fA-F]+|\d+", "#", head)[:60]
+
+    def _suppress_error(self, message: str) -> bool:
+        """Rate limit repeats of the same error shape."""
+        key = self._error_key(message)
+        now = time.monotonic()
+        last = self._recent_errors.get(key)
+        if last is not None and now - last < ERROR_REPEAT_S:
+            logger.debug("suppressed repeat error: %s", message)
+            return True
+        self._recent_errors[key] = now
+        return False
 
     def _connect(self) -> Optional[Session]:
         try:
@@ -166,6 +197,7 @@ class Controller:
         try:
             session.identify_adapter()
             session.discover()
+            self._emit("devices_changed", list(session.monitors.values()))
         except (ProtocolError, TransportError) as exc:
             self._emit("error", f"Discovery failed: {exc}")
         self.connected = True
@@ -195,6 +227,7 @@ class Controller:
         next_adapter_poll = 0.0
         monitor_cursor = 0
         next_monitor_poll = 0.0
+        next_discovery = 0.0
 
         while not self._stop.is_set():
             if session is None:
@@ -212,6 +245,13 @@ class Controller:
                 if now >= next_adapter_poll:
                     next_adapter_poll = now + cid.ADAPTER_POLL_INTERVAL_S
                     session.poll_adapter()
+
+                # Pick up speakers switched on after launch. Nothing else
+                # would: the poll loop only visits known monitors, so a new
+                # one generates no timeout and never triggers recovery.
+                if now >= next_discovery:
+                    next_discovery = now + cid.DISCOVERY_INTERVAL_S
+                    session.discover()
 
                 # Monitors refresh ~1 Hz, so poll them round-robin rather than
                 # all at once: it spreads bus load and keeps latency even.

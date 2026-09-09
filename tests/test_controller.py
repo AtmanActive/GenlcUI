@@ -190,3 +190,47 @@ def test_stop_is_clean_and_idempotent(tmp_path):
     ctl.stop()
     assert any(n == "stopped" for n, _ in events)
     assert not ctl.connected
+
+
+def test_repeated_errors_are_rate_limited(tmp_path):
+    """A desynchronised bus fails on every poll; the UI must not be flooded."""
+    ctl, _, _, events = make_controller(tmp_path)
+    for i in range(20):
+        ctl._emit("error", f"checksum 0x{i:04x} != computed 0x5de7")
+    errors = [e for e in events if e[0] == "error"]
+    assert len(errors) == 1, f"emitted {len(errors)} copies of one failure"
+
+
+def test_distinct_errors_are_still_reported(tmp_path):
+    ctl, _, _, events = make_controller(tmp_path)
+    ctl._emit("error", "checksum mismatch: aa")
+    ctl._emit("error", "truncated tag 0x06 at offset 0")
+    ctl._emit("error", "unexpected response code 0x19")
+    assert len([e for e in events if e[0] == "error"]) == 3
+
+
+def test_error_key_ignores_the_bytes_that_vary():
+    k = Controller._error_key
+    assert k("checksum 0x63ea != computed 0x761d for payload b'\\x01\\t'") == \
+           k("checksum 0x5def != computed 0x5de7 for payload b'\\x01\\x09'")
+    assert k("truncated tag 0xe6 at offset 18 in b'24\\xde'") == \
+           k("truncated tag 0xfd at offset 17 in b'99\\xaa'")
+    assert k("unexpected response code 0x19") != k("checksum 0x1 != computed 0x2")
+
+
+def test_discovery_runs_periodically(tmp_path):
+    """A speaker switched on after launch generates no timeout, so nothing
+    else would ever notice it."""
+    from genlcui.core import commands as cid
+
+    ctl, _, _, _ = make_controller(tmp_path)
+    calls = []
+    ctl.start()
+    try:
+        assert wait_for(lambda: ctl._session is not None)
+        original = ctl._session.discover
+        ctl._session.discover = lambda: (calls.append(1), original())[1]
+        assert wait_for(lambda: len(calls) >= 2,
+                        timeout=cid.DISCOVERY_INTERVAL_S * 3 + 2)
+    finally:
+        ctl.stop()
