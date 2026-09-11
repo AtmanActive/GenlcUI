@@ -53,6 +53,12 @@ WAKE_POLL_S = 0.25
 # trigger that on every poll -- three times a second, indefinitely.
 REDISCOVER_COOLDOWN_S = 2.0
 
+# How long the bus must have had nothing online before we deliberately stop
+# the keepalive, and for how long. The silence must outlast the lease
+# (~2-3s) for a stranded monitor to reset and answer RACE again.
+ORPHAN_RESYNC_AFTER_S = 10.0
+ORPHAN_QUIET_S = 4.0
+
 
 def db_to_sint24(db: float) -> int:
     """Master volume as the adapter expects it: linear, 24-bit signed."""
@@ -104,6 +110,9 @@ class Session:
         # thread must keep the heartbeat going: blocking it for five seconds
         # would expire every address lease.
         self._identify_until: Dict[int, float] = {}
+        self._devices_last = ()
+        self._quiet_until = 0.0
+        self._empty_since: Optional[float] = None
 
     # -- events ----------------------------------------------------------
 
@@ -116,6 +125,26 @@ class Session:
     # -- addressing ------------------------------------------------------
 
     @property
+    def online_count(self) -> int:
+        return sum(1 for m in self.monitors.values() if m.online)
+
+    def _devices_signature(self):
+        """What the UI would show. Used to emit only on real change."""
+        return tuple(sorted((m.serial, m.address, m.online)
+                            for m in self.monitors.values()))
+
+    def _emit_devices_if_changed(self) -> None:
+        """Announce the device list whenever it actually differs.
+
+        Previously this fired only when discovery *found* something, so a
+        speaker going away was never reported and the list went stale.
+        """
+        signature = self._devices_signature()
+        if signature != self._devices_last:
+            self._devices_last = signature
+            self._emit("devices_changed", list(self.monitors.values()))
+
+    @property
     def by_address(self) -> Dict[int, Monitor]:
         return {m.address: m for m in self.monitors.values()}
 
@@ -126,6 +155,13 @@ class Session:
         call on every loop iteration.
         """
         if self.asleep:
+            return
+        # A deliberate, bounded silence used to let a monitor we have lost
+        # track of drop its lease so RACE can find it again. Never gated on
+        # anything that changes moment to moment: a single failed poll used
+        # to mark every monitor offline, which stopped the heartbeat, which
+        # expired every real lease, which failed every poll. See maybe_resync.
+        if time.monotonic() < self._quiet_until:
             return
         now = time.monotonic()
         if force or now - self._last_heartbeat >= cid.HEARTBEAT_INTERVAL_S:
@@ -175,10 +211,34 @@ class Session:
         found: List[Monitor] = []
 
         while next_addr < MAX_ADDRESS:
-            serial = self._race()
+            try:
+                serial = self._race()
+            except ProtocolError:
+                # A monitor mid-boot can answer RACE with something we cannot
+                # read. Resynchronise and stop this pass; the next one is two
+                # seconds away.
+                logger.debug("malformed RACE reply", exc_info=True)
+                self.transport.drain(timeout_ms=20)
+                break
             if serial is None:
                 break
-            self._assign(serial, next_addr)
+
+            try:
+                self._assign(serial, next_addr)
+            except (ProtocolError, TransportError):
+                # Critical: the monitor may have taken the address anyway. If
+                # we abandon it here it stops answering RACE, and with the
+                # heartbeat gated on online_count its lease expires within a
+                # few seconds and the next pass finds it again. Recording it
+                # as offline keeps it visible in the meantime.
+                logger.warning("address %d not confirmed for serial %s; "
+                               "will retry", next_addr, serial, exc_info=True)
+                self.monitors.setdefault(
+                    serial, Monitor(serial=serial, address=next_addr)
+                ).online = False
+                self.transport.drain(timeout_ms=20)
+                break
+
             existing = self.monitors.get(serial)
             if existing is not None:
                 # Same speaker, new lease. Preserve everything else.
@@ -194,6 +254,8 @@ class Session:
 
         for monitor in found:
             if not monitor.model:
+                # Descriptive queries only; a failure here must not cost us
+                # the monitor itself.
                 self._identify(monitor)
 
         if found:
@@ -204,7 +266,10 @@ class Session:
             # holding silence deliberately.
             if not self._busy and self.volume_db is not None:
                 self._write_volume(self.volume_db)
-            self._emit("devices_changed", list(self.monitors.values()))
+
+        # Announce whenever the list actually changed -- including speakers
+        # that went away, which used to go unreported and leave the UI stale.
+        self._emit_devices_if_changed()
         return found
 
     def _identify(self, monitor: Monitor) -> None:
@@ -242,7 +307,8 @@ class Session:
 
     # -- recovery --------------------------------------------------------
 
-    def _with_recovery(self, fn: Callable[[], object]) -> object:
+    def _with_recovery(self, fn: Callable[[], object],
+                       offline: Optional[Monitor] = None) -> object:
         """Run fn, and on a lease expiry re-discover once and retry.
 
         Rate limited. A monitor that is booting, powered off or unplugged
@@ -259,8 +325,13 @@ class Session:
                 raise
             self._last_rediscover = now
             logger.info("address lease expired; re-discovering")
-            for monitor in self.monitors.values():
-                monitor.online = False
+            if offline is not None:
+                # Only the one that actually failed. Marking all of them was
+                # harmless while the heartbeat ran unconditionally, but it is
+                # a lie about the other speakers and it made every timeout
+                # look like a total bus loss.
+                offline.online = False
+            self._emit_devices_if_changed()
             self.discover()
             return fn()
 
@@ -301,7 +372,7 @@ class Session:
         def go():
             return self.transport.request(Request(monitor.address, cid.CID_POLL))
 
-        resp = self._with_recovery(go)
+        resp = self._with_recovery(go, offline=monitor)
         if resp.is_empty_ack:
             # Rate limit, not a dropout: keep the previous reading.
             return None
@@ -548,6 +619,35 @@ class Session:
                                exc_info=True)
         if targets:
             self._emit("identifying", None)
+
+    def maybe_resync(self) -> bool:
+        """Let a lost monitor's lease expire, so RACE can find it again.
+
+        A monitor that was assigned an address but never recorded answers
+        neither its address nor RACE, and our keepalive would hold it in that
+        state indefinitely. The escape is a bounded silence -- but silence
+        also drops the leases of monitors that are working, so it is only
+        entered once the bus has had nothing online for a good while, when
+        there is nothing left to lose.
+        """
+        now = time.monotonic()
+        if self.asleep or self.online_count:
+            self._empty_since = None
+            return False
+        if self._empty_since is None:
+            self._empty_since = now
+            return False
+        if now - self._empty_since < ORPHAN_RESYNC_AFTER_S:
+            return False
+        if now < self._quiet_until:
+            return False
+
+        logger.info("nothing online for %.0fs; going quiet for %.1fs so any "
+                    "stranded monitor drops its lease",
+                    now - self._empty_since, ORPHAN_QUIET_S)
+        self._quiet_until = now + ORPHAN_QUIET_S
+        self._empty_since = now + ORPHAN_QUIET_S
+        return True
 
     def service_identify(self) -> None:
         """Restore any monitor whose identify window has elapsed.

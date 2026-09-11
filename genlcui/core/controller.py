@@ -289,6 +289,7 @@ class Controller:
                 session.heartbeat()
                 # Restores a flagged LED even if whoever asked has gone away.
                 session.service_identify()
+                session.maybe_resync()
 
                 now = time.monotonic()
                 if now >= next_adapter_poll:

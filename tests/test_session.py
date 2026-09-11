@@ -5,6 +5,8 @@ and would be expensive to rediscover: lease recovery, empty-ACK handling,
 volume clamping, and wake ordering.
 """
 
+import time
+
 import pytest
 
 from genlcui.core import commands as cid
@@ -14,7 +16,9 @@ from genlcui.core.protocol import (
     BROADCAST_ADDR, DeviceTimeout, GNET_ACK, GNET_TIMEOUT, ProtocolError,
     Request,
 )
-from genlcui.core.session import Session, db_to_sint24
+from genlcui.core.session import (
+    ORPHAN_RESYNC_AFTER_S, Session, db_to_sint24,
+)
 from genlcui.core.transport import Transport
 
 
@@ -733,3 +737,158 @@ def test_service_identify_is_cheap_when_nothing_is_flagged():
     for _ in range(100):
         session.service_identify()
     assert len(hid.written) == before
+
+
+# -- recovery from a power cycle -----------------------------------------
+#
+# Speakers on automated power switches go away and come back while the app
+# keeps running. The failure this covers: they vanished from the list and
+# never reappeared, while volume, presets and the knob all kept working.
+
+def test_heartbeat_does_not_stop_merely_because_a_poll_failed():
+    """Regression, and a bad one: gating the keepalive on the online flag
+    meant one failed poll stopped STAY_ONLINE for every speaker, which
+    expired every real lease, which failed every poll. Self-sustaining."""
+    hid, session, _ = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=False)
+    marker = len(hid.written)
+    session.heartbeat(force=True)
+    sent = [c for _, c in hid.sent_requests()[marker:]]
+    assert cid.CID_STAY_ONLINE in sent
+
+
+def test_heartbeat_is_suspended_only_during_a_deliberate_quiet_window():
+    hid, session, _ = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=True)
+    session._quiet_until = time.monotonic() + 5
+    marker = len(hid.written)
+    for _ in range(5):
+        session.heartbeat(force=True)
+    sent = [c for _, c in hid.sent_requests()[marker:]]
+    assert cid.CID_STAY_ONLINE not in sent
+
+
+def test_resync_waits_for_a_sustained_idle_bus():
+    """Going quiet drops working leases too, so it must not trigger on a
+    momentary gap."""
+    _, session, _ = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=False)
+    assert session.maybe_resync() is False          # starts the clock
+    assert session.maybe_resync() is False          # still far too soon
+
+
+def test_resync_triggers_once_the_bus_has_been_idle_long_enough():
+    _, session, _ = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=False)
+    session.maybe_resync()
+    session._empty_since = time.monotonic() - (ORPHAN_RESYNC_AFTER_S + 1)
+    assert session.maybe_resync() is True
+    assert session._quiet_until > time.monotonic()
+
+
+def test_resync_never_triggers_while_something_is_online():
+    """There would be a working lease to lose."""
+    _, session, _ = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=True)
+    session._empty_since = time.monotonic() - 600
+    assert session.maybe_resync() is False
+
+
+def test_resync_never_triggers_while_asleep():
+    _, session, _ = make()
+    session.shutdown()
+    session._empty_since = time.monotonic() - 600
+    assert session.maybe_resync() is False
+
+
+def test_one_failing_monitor_does_not_mark_the_others_offline():
+    """A single dead speaker is not a total bus loss, and saying so greyed
+    out speakers that were working perfectly."""
+    replies = [frame(b"", code=GNET_TIMEOUT)] * 6
+    hid, session, _ = make(replies)
+    dead = Monitor(serial=1, address=2, online=True)
+    alive = Monitor(serial=2, address=3, online=True)
+    session.monitors.update({1: dead, 2: alive})
+    with pytest.raises(DeviceTimeout):
+        session.poll_monitor(dead)
+    assert not dead.online
+    assert alive.online, "an unrelated speaker was marked offline"
+
+
+def test_failed_assignment_does_not_strand_the_monitor():
+    """If SET_RID is not confirmed the speaker may still have taken the
+    address, stop answering RACE, and become invisible forever."""
+    replies = [frame(b"\x00\x11\x22"),      # RACE -> a serial
+               frame(b"\x99")]              # SET_RID -> wrong confirmation
+    hid, session, _ = make(replies)
+    session.discover()
+    assert 0x001122 in session.monitors, "the speaker was forgotten entirely"
+    assert session.online_count == 0        # so the heartbeat lets it expire
+
+
+def test_a_stranded_monitor_is_recovered_on_a_later_pass():
+    replies = [frame(b"\x00\x11\x22"), frame(b"\x99")]      # pass 1: fails
+    hid, session, _ = make(replies)
+    session.discover()
+    assert session.online_count == 0
+
+    hid.replies = [frame(b"\x00\x11\x22"), frame(b"\x02"), None]   # pass 2
+    session.discover()
+    monitor = session.monitors[0x001122]
+    assert monitor.online and monitor.address == 2
+
+
+def test_malformed_race_reply_does_not_abort_discovery_permanently():
+    hid, session, _ = make([frame(b"\x01\x02")])       # not a 3-byte serial
+    session.discover()                                  # must not raise
+
+    hid.replies = [frame(b"\x00\x11\x22"), frame(b"\x02"), None]
+    assert len(session.discover()) == 1
+
+
+def test_speakers_going_away_is_reported_to_the_ui():
+    """The visible symptom: the list went stale because nothing announced
+    that the monitors had gone."""
+    hid, session, events = make([frame(b"", code=GNET_TIMEOUT)] * 10)
+    monitor = Monitor(serial=1, address=2, online=True)
+    session.monitors[1] = monitor
+    session._emit_devices_if_changed()          # establish the baseline
+    events.clear()
+
+    with pytest.raises(DeviceTimeout):
+        session.poll_monitor(monitor)
+    assert [e for e in events if e[0] == "devices_changed"]
+    assert not monitor.online
+
+
+def test_device_list_is_not_announced_when_unchanged():
+    """poll runs at 1 Hz per monitor; re-emitting every time would churn."""
+    _, session, events = make()
+    session.monitors[1] = Monitor(serial=1, address=2, online=True)
+    session._emit_devices_if_changed()
+    events.clear()
+    for _ in range(5):
+        session._emit_devices_if_changed()
+    assert not [e for e in events if e[0] == "devices_changed"]
+
+
+def test_full_power_cycle_round_trip():
+    """Powered off, then back on: the list must come back by itself."""
+    replies = [frame(b"\x00\x11\x22"), frame(b"\x02"), None]
+    hid, session, _ = make(replies)
+    session.discover()
+    assert session.online_count == 1
+
+    # Power off: polls time out, recovery finds nothing.
+    hid.replies = [frame(b"", code=GNET_TIMEOUT)] * 8
+    monitor = session.monitors[0x001122]
+    with pytest.raises(DeviceTimeout):
+        session.poll_monitor(monitor)
+    assert session.online_count == 0
+
+    # Power on again.
+    session._last_rediscover = 0.0
+    hid.replies = [frame(b"\x00\x11\x22"), frame(b"\x02"), None]
+    session.discover()
+    assert session.online_count == 1
+    assert session.monitors[0x001122].online
