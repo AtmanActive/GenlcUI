@@ -8,6 +8,9 @@ day-to-day control such as levels, presets, wake/sleep, live status. It is **not
 calibration tool and never writes to speaker flash, so a calibration made with
 GLM5 stays exactly as you left it.
 
+![Screenshot A](gfx/screenshot_a.jpg)
+![Screenshot B](gfx/screenshot_b.jpg)
+
 ## Features
 
 - **Level presets** — four level presets, can be (re)named and recalled with a click, from the tray, or from the global KDE keyboard shortcut
